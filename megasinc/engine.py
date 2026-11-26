@@ -23,8 +23,8 @@ from typing import Callable, Optional
 import numpy as np
 
 from .analysis import coarse_match, compute_features, refine_match
-from .media import (ANALYSIS_SR, Cancelled, FFmpegError, cache_key, cleanup_cache,
-                    default_cache_dir, extract_pcm, open_pcm, probe)
+from .media import Cancelled, cleanup_cache, default_cache_dir, probe
+from .prepare import prepare_clip
 from .project import Clip, Project, Status
 
 ProgressFn = Callable[[float, str], None]
@@ -176,25 +176,10 @@ class SyncEngine:
                 self.progress(p0 + (p1 - p0) * (k + 1) / len(todo), f"Metadados: {c.name}")
 
     def _analyze_one(self, c: Clip, report: Callable[[float], None]) -> None:
-        key = cache_key(c.path)
-        pcm_path = self.cache_dir / f"{key}.pcm"
-        feat_path = self.cache_dir / f"{key}.feat.npy"
-        if not pcm_path.exists():
-            extract_pcm(c.info, pcm_path, cancel=self.cancel, progress=report)
-        else:
-            os.utime(pcm_path)
-        pcm = open_pcm(pcm_path)
-        if feat_path.exists():
-            feat = np.load(feat_path)
-            os.utime(feat_path)
-        else:
-            feat = compute_features(pcm)
-            np.save(feat_path, feat)
-        self.pcm[c.uid] = pcm
-        self.feat[c.uid] = feat
-        # a duração exata vem do número de amostras decodificadas
-        if len(pcm) and c.info and not c.info.has_video:
-            c.info.duration = len(pcm) / ANALYSIS_SR
+        pcm, feat = prepare_clip(c, self.cache_dir, cancel=self.cancel, progress=report)
+        if pcm is not None:
+            self.pcm[c.uid] = pcm
+            self.feat[c.uid] = feat
 
     def _analyze_all(self, clips: list[Clip], p0: float, p1: float) -> None:
         todo = [c for c in clips if c.info is not None and c.status != Status.ERROR]

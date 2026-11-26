@@ -24,7 +24,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-15, name: macOS-arm64 }         # Apple Silicon (M1–M4)
+          - { os: macos-latest, name: macOS-arm64 }     # Apple Silicon (M1–M4)
           - { os: macos-15-intel, name: macOS-x86_64 }  # Mac Intel
           - { os: windows-latest, name: Windows-x64 }
     runs-on: ${{ matrix.os }}
@@ -79,7 +79,11 @@ jobs:
   # Publica (ou atualiza) a Release vX.Y.Z com os instaladores a cada push na main.
   # A versão vem de megasinc/__init__.py — para lançar uma nova, aumente __version__.
   release:
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    # publica mesmo se uma das plataformas falhar (ex.: fila de Macs cheia no GitHub)
+    if: >-
+      always() && !cancelled() && needs.build.result != 'skipped' &&
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: build
     runs-on: ubuntu-latest
     permissions: { contents: write }

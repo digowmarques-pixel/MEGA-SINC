@@ -1,108 +1,199 @@
-"""Visualização da timeline sincronizada."""
+"""Timeline visual (tela principal): faixas com cabeçalho, clipes com forma de
+onda, progresso de preparação por clipe, arrastar clipes entre faixas."""
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Optional
 
+import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import QScrollArea, QToolTip, QWidget
 
-from ..media import seconds_to_tc
-from ..project import Project
-from ..timeline import Timeline, build_timeline
+from ..media import fps_label, seconds_to_tc
+from ..prepare import WAVE_RATE
+from ..project import Clip, Project, Status
+from ..timeline import DEFAULT_FPS, build_timeline
 
-LABEL_W = 150
-RULER_H = 26
-ROW_H = 30
-ROW_GAP = 4
+HEAD_W = 250
+RULER_H = 34
+ROW_H = 74
+SUB_H = 46          # sub-faixas (clipes sobrepostos do mesmo aparelho)
+GAP_S = 0.02        # espaço entre clipes antes da sincronia (fração da duração)
 
-# Paleta Mega Sinc: tons escuros + amarelo
+# Paleta Mega Sinc
 YELLOW = QColor("#FFC400")
-C_BG = QColor("#111111")
-C_ROW = QColor("#1a1a1a")
-C_ROW_ALT = QColor("#1e1e1e")
-C_RULER = QColor("#222222")
-C_LABELS = QColor("#161616")
-C_TEXT = QColor("#ECECEC")
-C_DIM = QColor("#8E8E8E")
-C_VIDEO = QColor("#FFC400")     # câmeras: amarelo
-C_AUDIO = QColor("#5B5F66")     # gravadores: grafite
-C_REF = QColor("#FFE27A")       # referência: amarelo claro
-C_SEL = QColor("#FFFFFF")
-C_FAIL = QColor("#FF4D4D")      # não sincronizado / erro
-FAIL_ROW = "✖ Não sincronizados"
+YELLOW_LIGHT = QColor("#FFE27A")
+GRAPHITE = QColor("#6B7079")
+PENDING = QColor("#4A4A4A")
+RED = QColor("#FF4D4D")
+BG = QColor("#141414")
+ROW_BG = QColor("#1b1b1b")
+ROW_BG2 = QColor("#1f1f1f")
+HEAD_BG = QColor("#181818")
+RULER_BG = QColor("#0d0d0d")
+TEXT = QColor("#ECECEC")
+DIM = QColor("#8E8E8E")
+FAIL_ROW = "__fail__"
+
+
+@dataclass
+class Row:
+    track: str
+    lane: int
+    y: float
+    h: float
+    fail: bool = False
+
+
+@dataclass
+class Block:
+    clip: Clip
+    start: float
+    dur: float
+    row: int
+
+
+def _icon_camera(p: QPainter, x: float, y: float, col: QColor) -> None:
+    p.setPen(Qt.NoPen)
+    p.setBrush(col)
+    p.drawRoundedRect(QRectF(x, y + 6, 34, 22), 4, 4)
+    p.drawRoundedRect(QRectF(x + 9, y + 2, 14, 7), 2, 2)
+    p.setBrush(HEAD_BG)
+    p.drawEllipse(QPointF(x + 17, y + 17), 7, 7)
+    p.setBrush(col)
+    p.drawEllipse(QPointF(x + 17, y + 17), 4, 4)
+
+
+def _icon_mic(p: QPainter, x: float, y: float, col: QColor) -> None:
+    p.setPen(Qt.NoPen)
+    p.setBrush(col)
+    p.drawRoundedRect(QRectF(x + 11, y + 1, 12, 20), 6, 6)
+    p.setPen(QPen(col, 3, Qt.SolidLine, Qt.RoundCap))
+    p.setBrush(Qt.NoBrush)
+    p.drawArc(QRectF(x + 6, y + 6, 22, 20), 200 * 16, 140 * 16)
+    p.drawLine(QPointF(x + 17, y + 26), QPointF(x + 17, y + 31))
+    p.drawLine(QPointF(x + 11, y + 31), QPointF(x + 23, y + 31))
 
 
 class TimelineCanvas(QWidget):
-    clipClicked = Signal(int)
+    clipSelected = Signal(int)
+    clipMoved = Signal(int, str)            # uid, faixa ("" = nova faixa)
+    trackMenu = Signal(str, object)         # faixa, posição global
+    clipMenu = Signal(int, object)          # uid, posição global
+    trackRename = Signal(str)
+    filesDropped = Signal(list, object)     # caminhos, faixa ou None
+    deleteRequested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setMouseTracking(True)
-        self.tl: Optional[Timeline] = None
-        self.ref_uid: Optional[int] = None
-        self.px_per_s = 4.0
-        self.selected: set[int] = set()
-        self._rows: list[tuple[str, int, bool]] = []    # (faixa, lane, vídeo?)
-        self._rects: list[tuple[QRectF, object]] = []
-        self.setMinimumHeight(RULER_H + ROW_H)
+        self.setAcceptDrops(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.project: Optional[Project] = None
+        self.fps = DEFAULT_FPS
+        self.px_per_s = 2.0
+        self.rows: list[Row] = []
+        self.blocks: list[Block] = []
+        self.synced_mode = False
+        self.selected: Optional[int] = None
+        self.ref_track: Optional[str] = None
+        self.total = 0.0
+        self._rects: list[tuple[QRectF, Block]] = []
+        self._drag: Optional[tuple[int, QPointF]] = None
+        self._drag_row: Optional[int] = None
+        self._drop_row: Optional[int] = None
+        self._auto_fit = True
 
-    # ------------------------------------------------------------------
-    def set_project(self, project: Project) -> None:
-        synced = [c for c in project.all_clips() if c.is_synced]
-        if not synced:
-            self.tl = None
-        else:
-            self.tl = build_timeline(project)
-        self.ref_uid = next((c.uid for c in synced if c.status == "referência"), None)
-        self._rows = []
-        if self.tl:
-            for tr in self.tl.tracks:
-                for lane in range(tr.lanes):
-                    self._rows.append((tr.name, lane, tr.is_video))
-            # clipes que falharam: linha vermelha no fim, lado a lado (sem posição real)
-            from ..timeline import TimelineItem
-            cursor = 0.0
-            gap = max(1.0, self.tl.duration * 0.01)
-            failed = [c for c in project.all_clips()
-                      if c.status in ("não sincronizado", "erro") and c.info]
-            for c in failed:
-                dur = max(c.duration, 1.0)
-                self.tl.items.append(TimelineItem(c, c.path, c.info, cursor, dur, FAIL_ROW))
-                cursor += dur + gap
+    # ------------------------------------------------------------- modelo
+    def set_project(self, project: Project, fps=None) -> None:
+        self.project = project
+        self.rebuild(fps)
+
+    def rebuild(self, fps=None) -> None:
+        pr = self.project
+        self.rows, self.blocks = [], []
+        if pr is None:
+            self.update()
+            return
+        synced = [c for c in pr.all_clips() if c.is_synced]
+        # estrela só na referência escolhida ou na que realmente foi usada
+        root = next((c for c in synced if c.status == Status.REFERENCE), None)
+        self.ref_track = pr.reference or (pr.track_of(root).name if root and pr.track_of(root)
+                                          else None)
+        self.synced_mode = bool(synced)
+        y = RULER_H
+        if self.synced_mode:
+            tl = build_timeline(pr, fps)
+            self.fps = tl.fps
+            lanes = {t.name: t.lanes for t in tl.tracks}
+            row_index = {}
+            for t in pr.tracks:
+                for lane in range(max(1, lanes.get(t.name, 1))):
+                    h = ROW_H if lane == 0 else SUB_H
+                    row_index[(t.name, lane)] = len(self.rows)
+                    self.rows.append(Row(t.name, lane, y, h))
+                    y += h + 2
+            for it in tl.items:
+                self.blocks.append(Block(it.clip, it.start, it.duration,
+                                         row_index[(it.track, it.lane)]))
+            failed = [c for c in pr.all_clips() if c.status in (Status.UNSYNCED, Status.ERROR)]
             if failed:
-                self._rows.append((FAIL_ROW, 0, False))
+                self.rows.append(Row(FAIL_ROW, 0, y, ROW_H, fail=True))
+                y += ROW_H + 2
+                cur, gap = 0.0, max(1.0, tl.duration * GAP_S)
+                for c in failed:
+                    d = max(c.duration, 1.0)
+                    self.blocks.append(Block(c, cur, d, len(self.rows) - 1))
+                    cur += d + gap
+        else:
+            fpsc = [c.info.fps for c in pr.all_clips() if c.info and c.info.fps]
+            self.fps = fps or (max(set(fpsc), key=fpsc.count) if fpsc else DEFAULT_FPS)
+            longest = max((sum(max(c.duration, 1) for c in t.clips) for t in pr.tracks),
+                          default=60.0)
+            gap = max(0.5, longest * GAP_S)
+            for t in pr.tracks:
+                self.rows.append(Row(t.name, 0, y, ROW_H))
+                cur = 0.0
+                for c in t.clips:
+                    d = max(c.duration, 1.0) if c.info else 30.0
+                    self.blocks.append(Block(c, cur, d, len(self.rows) - 1))
+                    cur += d + gap
+                y += ROW_H + 2
+        self.total = max((b.start + b.dur for b in self.blocks), default=0.0)
+        self._content_h = y + ROW_H        # espaço extra = soltar para "nova faixa"
         self._relayout()
 
-    def set_selected(self, uids: set[int]) -> None:
-        self.selected = set(uids)
-        self.update()
-
+    # ---------------------------------------------------------------- zoom
     def fit(self, width: int) -> None:
-        if self.tl and self.tl.duration > 0:
-            self.px_per_s = max(0.02, (width - LABEL_W - 30) / self.tl.duration)
-            self._relayout()
+        if self.total > 0:
+            self.px_per_s = max(0.005, (width - HEAD_W - 40) / self.total)
+        self._relayout()
 
     def zoom(self, factor: float) -> None:
-        self.px_per_s = float(min(400.0, max(0.01, self.px_per_s * factor)))
+        self._auto_fit = False
+        self.px_per_s = float(min(500.0, max(0.005, self.px_per_s * factor)))
         self._relayout()
 
     def _relayout(self) -> None:
-        dur = self.tl.duration if self.tl else 0
-        w = int(LABEL_W + dur * self.px_per_s + 40)
-        h = RULER_H + max(1, len(self._rows)) * (ROW_H + ROW_GAP) + 10
+        w = int(HEAD_W + self.total * self.px_per_s + 60)
+        h = int(getattr(self, "_content_h", RULER_H + ROW_H))
+        par = self.parentWidget()
+        if par is not None:
+            w = max(w, par.width())
+            h = max(h, par.height())
         self.setMinimumSize(w, h)
-        self.resize(max(w, self.parentWidget().width() if self.parentWidget() else w), h)
+        self.resize(w, h)
         self.update()
 
-    # ------------------------------------------------------------------
-    def _x(self, t: float) -> float:
-        return LABEL_W + t * self.px_per_s
+    def x_of(self, t: float) -> float:
+        return HEAD_W + t * self.px_per_s
 
-    def _tick_step(self) -> float:
-        target = 90 / max(self.px_per_s, 1e-9)
-        for s in (0.04, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600):
+    # --------------------------------------------------------------- pintura
+    def _tick(self) -> float:
+        target = 110 / max(self.px_per_s, 1e-9)
+        for s in (0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600):
             if s >= target:
                 return s
         return 7200
@@ -110,126 +201,318 @@ class TimelineCanvas(QWidget):
     def paintEvent(self, _ev) -> None:  # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        p.fillRect(self.rect(), C_BG)
         vis = self.visibleRegion().boundingRect()
-        left = vis.left()
-        self._rects = []
-        font = QFont(self.font())
-        font.setPointSizeF(max(8.0, font.pointSizeF() - 1))
-        p.setFont(font)
+        left, right = vis.left(), vis.right()
+        p.fillRect(self.rect(), BG)
+        f = QFont(self.font())
+        f.setPointSizeF(max(8.0, f.pointSizeF() - 1))
+        p.setFont(f)
+        fm = p.fontMetrics()
 
-        if not self.tl:
-            p.setPen(C_DIM)
-            p.drawText(self.rect(), Qt.AlignCenter,
-                       "Adicione arquivos e clique em Sincronizar para ver a timeline")
+        if not self.rows:
+            p.setPen(DIM)
+            big = QFont(self.font())
+            big.setPointSizeF(big.pointSizeF() + 5)
+            p.setFont(big)
+            p.drawText(QRectF(left, 0, vis.width(), vis.height()), Qt.AlignCenter,
+                       "Arraste aqui as pastas ou arquivos\ndas câmeras e gravadores")
+            p.setPen(QPen(QColor("#333"), 2, Qt.DashLine))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(QRectF(left + 40, 40, vis.width() - 80, vis.height() - 80), 16, 16)
             return
 
-        # linhas
-        for k, (name, lane, is_video) in enumerate(self._rows):
-            y = RULER_H + k * (ROW_H + ROW_GAP)
-            bg = QColor("#2A0F0F") if name == FAIL_ROW else (C_ROW if k % 2 == 0 else C_ROW_ALT)
-            p.fillRect(QRectF(0, y, self.width(), ROW_H), bg)
+        # fundo das linhas
+        for k, r in enumerate(self.rows):
+            col = QColor("#2A0F0F") if r.fail else (ROW_BG if k % 2 == 0 else ROW_BG2)
+            if self._drop_row == k:
+                col = QColor("#3a3220")
+            p.fillRect(QRectF(0, r.y, self.width(), r.h), col)
+        if self._drop_row == len(self.rows):
+            y = self.rows[-1].y + self.rows[-1].h + 2
+            p.fillRect(QRectF(left, y, vis.width(), ROW_H), QColor("#3a3220"))
+            p.setPen(YELLOW)
+            p.drawText(QRectF(left + HEAD_W, y, vis.width() - HEAD_W, ROW_H), Qt.AlignCenter,
+                       "Soltar aqui para criar uma nova faixa")
 
-        # régua
-        p.fillRect(QRectF(0, 0, self.width(), RULER_H), C_RULER)
-        step = self._tick_step()
-        t0 = max(0.0, (left - LABEL_W) / self.px_per_s)
-        t1 = (vis.right() - LABEL_W) / self.px_per_s
+        # grade e régua
+        step = self._tick()
+        t0 = max(0.0, (left - HEAD_W) / self.px_per_s)
+        t1 = (right - HEAD_W) / self.px_per_s
         t = math.floor(t0 / step) * step
-        p.setPen(QPen(C_DIM, 1))
+        p.fillRect(QRectF(left, 0, vis.width(), RULER_H), RULER_BG)
+        minor = step / 5
         while t <= t1 + step:
-            x = self._x(t)
-            p.drawLine(QPointF(x, RULER_H - 8), QPointF(x, RULER_H))
+            x = self.x_of(t)
+            p.setPen(QPen(QColor(255, 255, 255, 14), 1))
             p.drawLine(QPointF(x, RULER_H), QPointF(x, self.height()))
-            p.setPen(C_TEXT)
-            p.drawText(QPointF(x + 3, RULER_H - 10), seconds_to_tc(t, self.tl.fps))
-            p.setPen(QPen(QColor(255, 255, 255, 18), 1))
+            p.setPen(QPen(DIM, 1))
+            p.drawLine(QPointF(x, RULER_H - 12), QPointF(x, RULER_H))
+            for m in range(1, 5):
+                xm = self.x_of(t + m * minor)
+                p.drawLine(QPointF(xm, RULER_H - 5), QPointF(xm, RULER_H))
+            p.setPen(TEXT)
+            p.drawText(QPointF(x + 4, RULER_H - 15), seconds_to_tc(t, self.fps))
             t += step
-        p.setPen(QPen(C_DIM, 1))
 
         # clipes
-        row_of = {(n, l): k for k, (n, l, _) in enumerate(self._rows)}
-        for it in self.tl.items:
-            k = row_of.get((it.track, it.lane))
-            if k is None:
+        self._rects = []
+        for b in self.blocks:
+            r = self.rows[b.row]
+            x0, x1 = self.x_of(b.start), self.x_of(b.start + b.dur)
+            rect = QRectF(x0, r.y + 4, max(3.0, x1 - x0 - 1), r.h - 8)
+            self._rects.append((rect, b))
+            if rect.right() < left + HEAD_W or rect.left() > right:
                 continue
-            y = RULER_H + k * (ROW_H + ROW_GAP)
-            x0, x1 = self._x(it.start), self._x(it.start + it.duration)
-            r = QRectF(x0, y + 3, max(2.0, x1 - x0), ROW_H - 6)
-            if r.right() < left or r.left() > vis.right():
-                self._rects.append((r, it))
-                continue
-            failed = it.track == FAIL_ROW
-            col = (C_FAIL if failed else C_REF if it.clip.uid == self.ref_uid
-                   else (C_VIDEO if it.info.has_video else C_AUDIO))
-            path = QPainterPath()
-            path.addRoundedRect(r, 4, 4)
-            p.fillPath(path, col)
-            if it.clip.uid in self.selected:
-                p.setPen(QPen(C_SEL, 2))
-            else:
-                p.setPen(QPen(col.darker(160), 1))
-            p.drawPath(path)
-            if r.width() > 30:
-                p.setPen(QColor("#111111") if col.lightness() > 140 else Qt.white)
-                tr = r.adjusted(6, 0, -4, 0)
-                if tr.left() < left + LABEL_W:
-                    tr.setLeft(min(tr.right(), left + LABEL_W + 4))
-                p.drawText(tr, Qt.AlignVCenter | Qt.AlignLeft,
-                           p.fontMetrics().elidedText(it.clip.name, Qt.ElideRight, int(tr.width())))
-            self._rects.append((r, it))
+            self._paint_clip(p, rect, b, r, left, right, fm)
 
-        # rótulos das faixas (fixos à esquerda)
-        p.fillRect(QRectF(left, 0, LABEL_W, self.height()), C_LABELS)
-        p.fillRect(QRectF(left, 0, LABEL_W, RULER_H), C_RULER)
-        p.setPen(C_DIM)
-        p.drawText(QRectF(left + 8, 0, LABEL_W - 8, RULER_H), Qt.AlignVCenter, f"{float(self.tl.fps):.3f} fps".replace(".000", ""))
-        for k, (name, lane, is_video) in enumerate(self._rows):
-            y = RULER_H + k * (ROW_H + ROW_GAP)
-            fail_row = name == FAIL_ROW
-            p.fillRect(QRectF(left, y + 4, 4, ROW_H - 8),
-                       C_FAIL if fail_row else (C_VIDEO if is_video else C_AUDIO))
-            p.setPen(C_FAIL if fail_row else (C_TEXT if lane == 0 else C_DIM))
-            label = name if lane == 0 else f"{name} ({lane + 1})"
-            p.drawText(QRectF(left + 12, y, LABEL_W - 16, ROW_H), Qt.AlignVCenter,
-                       p.fontMetrics().elidedText(label, Qt.ElideRight, LABEL_W - 16))
-        p.setPen(QPen(YELLOW.darker(220), 1))
-        p.drawLine(QPointF(left + LABEL_W, 0), QPointF(left + LABEL_W, self.height()))
+        # cabeçalhos (fixos à esquerda)
+        p.fillRect(QRectF(left, 0, HEAD_W, self.height()), HEAD_BG)
+        p.fillRect(QRectF(left, 0, HEAD_W, RULER_H), RULER_BG)
+        p.setPen(YELLOW)
+        p.drawText(QRectF(left + 14, 0, HEAD_W - 20, RULER_H), Qt.AlignVCenter,
+                   "SINCRONIZADO" if self.synced_mode else "MÍDIA")
+        p.setPen(DIM)
+        p.drawText(QRectF(left, 0, HEAD_W - 12, RULER_H), Qt.AlignVCenter | Qt.AlignRight,
+                   f"{fps_label(self.fps)} fps")
+        for k, r in enumerate(self.rows):
+            self._paint_header(p, r, left, fm)
+        p.setPen(QPen(QColor("#000"), 2))
+        p.drawLine(QPointF(left + HEAD_W, 0), QPointF(left + HEAD_W, self.height()))
 
-    # ------------------------------------------------------------------
-    def _item_at(self, pos):
-        for r, it in self._rects:
-            if r.contains(QPointF(pos)):
-                return it
+        # fantasma do arraste
+        if self._drag and self._drag_row is not None:
+            uid, pos = self._drag
+            blk = next((b for b in self.blocks if b.clip.uid == uid), None)
+            if blk is not None:
+                p.setPen(QPen(YELLOW, 2, Qt.DashLine))
+                p.setBrush(QColor(255, 196, 0, 40))
+                p.drawRoundedRect(QRectF(pos.x() - 60, pos.y() - 18, 180, 36), 6, 6)
+                p.setPen(TEXT)
+                p.drawText(QRectF(pos.x() - 54, pos.y() - 18, 170, 36), Qt.AlignVCenter,
+                           fm.elidedText(blk.clip.name, Qt.ElideRight, 165))
+
+    def _clip_color(self, b: Block, row: Row) -> QColor:
+        c = b.clip
+        if row.fail or c.status in (Status.UNSYNCED, Status.ERROR):
+            return RED
+        if not self.synced_mode:
+            return PENDING if c.prep < 1.0 else QColor("#5a5a5a")
+        if c.status == Status.REFERENCE:
+            return YELLOW_LIGHT
+        return YELLOW if c.has_video else GRAPHITE
+
+    def _paint_clip(self, p: QPainter, rect: QRectF, b: Block, row: Row, left, right, fm):
+        c = b.clip
+        col = self._clip_color(b, row)
+        path = QPainterPath()
+        path.addRoundedRect(rect, 3, 3)
+        p.fillPath(path, col)
+        dark_text = 0.299 * col.red() + 0.587 * col.green() + 0.114 * col.blue() > 150
+        wave_col = QColor(0, 0, 0, 120) if dark_text else QColor(255, 255, 255, 90)
+
+        # forma de onda (só a parte visível)
+        wave = c.wave
+        if wave is not None and len(wave) > 1 and rect.width() > 6:
+            vx0 = max(rect.left(), left + HEAD_W)
+            vx1 = min(rect.right(), right)
+            if vx1 > vx0:
+                cols = int(vx1 - vx0)
+                ts = (np.arange(cols + 1) + (vx0 - rect.left())) / rect.width() * b.dur
+                w = np.asarray(wave, dtype=np.float32)
+                # pico de cada coluna de pixel = máximo de wave[edges[i]:edges[i+1]]
+                edges = np.clip((ts * WAVE_RATE).astype(np.int64), 0, len(w) - 1)
+                peaks = np.maximum.reduceat(w, edges)[:cols]
+                base = rect.bottom() - 2
+                amp = (rect.height() - 22) * np.sqrt(peaks)
+                pts = [QPointF(vx0, base)]
+                pts += [QPointF(vx0 + i, base - a) for i, a in enumerate(amp)]
+                pts.append(QPointF(vx0 + cols, base))
+                p.setPen(Qt.NoPen)
+                p.setBrush(wave_col)
+                p.drawPolygon(QPolygonF(pts))
+
+        # texto: nome | duração | estado
+        if rect.width() > 40:
+            state = {Status.SYNCED: "sincronizado", Status.REFERENCE: "★ referência",
+                     Status.UNSYNCED: "✖ não sincronizado", Status.ERROR: "✖ erro"}.get(c.status)
+            if state is None:
+                state = "pronto" if c.prep >= 1.0 else ("preparando" if c.prep > 0 else "na fila")
+            label = f"{c.name}  |  {seconds_to_tc(c.duration, self.fps)}  |  {state}"
+            tr = QRectF(max(rect.left(), left + HEAD_W) + 6, rect.top() + 2,
+                        rect.right() - max(rect.left(), left + HEAD_W) - 10, 16)
+            p.setPen(QColor("#111") if dark_text else TEXT)
+            p.drawText(tr, Qt.AlignLeft | Qt.AlignVCenter,
+                       fm.elidedText(label, Qt.ElideRight, int(max(10, tr.width()))))
+
+        # progresso de preparação
+        if 0.0 <= c.prep < 1.0 and not self.synced_mode:
+            p.fillRect(QRectF(rect.left(), rect.bottom() - 4, rect.width(), 4), QColor("#222"))
+            p.fillRect(QRectF(rect.left(), rect.bottom() - 4, rect.width() * c.prep, 4), YELLOW)
+
+        if self.selected == c.uid:
+            p.setPen(QPen(QColor("#FFFFFF"), 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 3, 3)
+
+    def _paint_header(self, p: QPainter, r: Row, left: float, fm) -> None:
+        x = left
+        if r.fail:
+            p.fillRect(QRectF(x, r.y, 5, r.h), RED)
+            p.setPen(RED)
+            bf = QFont(self.font())
+            bf.setBold(True)
+            p.setFont(bf)
+            p.drawText(QRectF(x + 18, r.y + 12, HEAD_W - 24, 22), Qt.AlignVCenter,
+                       "✖ Não sincronizados")
+            p.setFont(self.font())
+            n = sum(1 for b in self.blocks if self.rows[b.row] is r)
+            p.drawText(QRectF(x + 18, r.y + 36, HEAD_W - 24, 20), Qt.AlignVCenter,
+                       f"{n} clipe(s) sem correspondência")
+            return
+        t = self.project.track(r.track) if self.project else None
+        if t is None:
+            return
+        if r.lane > 0:
+            p.setPen(DIM)
+            p.drawText(QRectF(x + 62, r.y, HEAD_W - 70, r.h), Qt.AlignVCenter,
+                       f"{t.name} — sobreposição {r.lane + 1}")
+            return
+        is_ref = r.track == self.ref_track
+        bad = any(c.status in (Status.UNSYNCED, Status.ERROR) for c in t.clips)
+        accent = RED if bad else (YELLOW if t.has_video or is_ref else GRAPHITE.lighter(140))
+        p.fillRect(QRectF(x, r.y, 5, r.h), accent)
+        icon_col = YELLOW if is_ref else QColor("#BDBDBD")
+        if t.has_video:
+            _icon_camera(p, x + 16, r.y + 18, icon_col)
+        else:
+            _icon_mic(p, x + 16, r.y + 18, icon_col)
+        bf = QFont(self.font())
+        bf.setBold(True)
+        bf.setPointSizeF(bf.pointSizeF() + 1)
+        p.setFont(bf)
+        p.setPen(TEXT)
+        name = t.name + ("  ★" if is_ref else "")
+        p.drawText(QRectF(x + 60, r.y + 10, HEAD_W - 66, 24), Qt.AlignVCenter,
+                   p.fontMetrics().elidedText(name, Qt.ElideRight, HEAD_W - 70))
+        p.setFont(self.font())
+        info = [f"{len(t.clips)} clipe" + ("s" if len(t.clips) != 1 else "")]
+        fpss = {c.info.fps for c in t.clips if c.info and c.info.fps}
+        if len(fpss) == 1:
+            info.append(f"{fps_label(next(iter(fpss)))} fps")
+        chs = {c.info.audio_channels for c in t.clips if c.info and c.info.has_audio}
+        if len(chs) == 1:
+            n = next(iter(chs))
+            info.append(f"{n} canal" + ("is" if n != 1 else ""))
+        p.setPen(DIM)
+        p.drawText(QRectF(x + 60, r.y + 34, HEAD_W - 66, 20), Qt.AlignVCenter,
+                   p.fontMetrics().elidedText("  |  ".join(info), Qt.ElideRight, HEAD_W - 70))
+        if is_ref:
+            p.setPen(YELLOW)
+            p.drawText(QRectF(x + 60, r.y + 52, HEAD_W - 66, 16), Qt.AlignVCenter, "referência")
+        elif bad:
+            p.setPen(RED)
+            p.drawText(QRectF(x + 60, r.y + 52, HEAD_W - 66, 16), Qt.AlignVCenter,
+                       "tem clipe não sincronizado")
+
+    # ------------------------------------------------------------- interação
+    def _row_at(self, y: float) -> Optional[int]:
+        for k, r in enumerate(self.rows):
+            if r.y <= y < r.y + r.h + 2:
+                return k
+        if self.rows and y >= self.rows[-1].y + self.rows[-1].h:
+            return len(self.rows)        # área vazia abaixo = nova faixa
         return None
 
+    def _block_at(self, pos: QPointF) -> Optional[Block]:
+        for rect, b in reversed(self._rects):
+            if rect.contains(pos):
+                return b
+        return None
+
+    def _in_header(self, pos: QPointF) -> bool:
+        return pos.x() < self.visibleRegion().boundingRect().left() + HEAD_W
+
     def mousePressEvent(self, ev) -> None:  # noqa: N802
-        it = self._item_at(ev.position())
-        if it is not None:
-            self.clipClicked.emit(it.clip.uid)
+        pos = ev.position()
+        if self._in_header(pos):
+            k = self._row_at(pos.y())
+            if k is not None and k < len(self.rows) and not self.rows[k].fail and \
+                    ev.button() == Qt.RightButton:
+                self.trackMenu.emit(self.rows[k].track, ev.globalPosition().toPoint())
+            return
+        b = self._block_at(pos)
+        self.selected = b.clip.uid if b else None
+        if b:
+            self.clipSelected.emit(b.clip.uid)
+            if ev.button() == Qt.RightButton:
+                self.clipMenu.emit(b.clip.uid, ev.globalPosition().toPoint())
+            elif ev.button() == Qt.LeftButton:
+                self._drag = (b.clip.uid, pos)
+        self.update()
+
+    def mouseDoubleClickEvent(self, ev) -> None:  # noqa: N802
+        pos = ev.position()
+        if self._in_header(pos):
+            k = self._row_at(pos.y())
+            if k is not None and k < len(self.rows) and not self.rows[k].fail:
+                self.trackRename.emit(self.rows[k].track)
 
     def mouseMoveEvent(self, ev) -> None:  # noqa: N802
-        it = self._item_at(ev.position())
-        if it is None:
+        pos = ev.position()
+        if self._drag and ev.buttons() & Qt.LeftButton:
+            uid, start = self._drag
+            if (pos - start).manhattanLength() > 8:
+                self._drag = (uid, pos)
+                self._drag_row = self._row_at(pos.y())
+                self._drop_row = self._drag_row
+                self.update()
+            return
+        b = self._block_at(pos)
+        if b is None or self._in_header(pos):
             QToolTip.hideText()
             return
-        c = it.clip
-        lines = [f"<b>{c.name}</b>", f"Faixa: {it.track}",
-                 f"Início: {seconds_to_tc(it.start, self.tl.fps)} ({it.start:.3f} s)",
-                 f"Duração: {it.duration:.2f} s"]
-        if it.track == FAIL_ROW:
-            lines = [f"<b style='color:#FF4D4D'>✖ {c.name}</b>",
-                     f"<span style='color:#FF4D4D'>{c.status.upper()}: {c.message}</span>",
-                     "Posição desconhecida — verifique se o áudio é do mesmo evento."]
-        elif c.status == "sincronizado":
-            lines.append(f"Confiança: {c.confidence:.1f}")
-        elif c.status == "referência":
-            lines.append("Clipe de referência")
-        if c.drift_reliable and abs(c.drift) > 1e-6:
-            lines.append(f"Drift: {c.drift * 1e6:+.1f} ppm")
-        if it.corrected:
-            lines.append("Drift corrigido")
+        c = b.clip
+        lines = [f"<b>{c.name}</b>", c.path]
+        if c.info:
+            if c.info.has_video:
+                lines.append(f"Vídeo {c.info.width}×{c.info.height} · {fps_label(c.info.fps)} fps")
+            if c.info.has_audio:
+                lines.append(f"Áudio {c.info.audio_rate / 1000:g} kHz · "
+                             f"{c.info.audio_channels} canal(is)")
+        if self.synced_mode and c.is_synced:
+            lines.append(f"Início na timeline: {seconds_to_tc(b.start, self.fps)}")
+            if c.status == Status.SYNCED:
+                lines.append(f"Confiança: {c.confidence:.0f}")
+            if c.drift_reliable and abs(c.drift) > 5e-7:
+                lines.append(f"Drift: {c.drift * 1e6:+.1f} ppm")
+        if c.status in (Status.UNSYNCED, Status.ERROR):
+            lines.append(f"<span style='color:#FF4D4D'><b>✖ {c.status.upper()}</b>"
+                         f"{': ' + c.message if c.message else ''}</span>")
         QToolTip.showText(ev.globalPosition().toPoint(), "<br>".join(lines), self)
+
+    def mouseReleaseEvent(self, ev) -> None:  # noqa: N802
+        if self._drag and self._drag_row is not None:
+            uid = self._drag[0]
+            k = self._drag_row
+            blk = next((b for b in self.blocks if b.clip.uid == uid), None)
+            if blk is not None:
+                if k == len(self.rows):
+                    self.clipMoved.emit(uid, "")
+                elif 0 <= k < len(self.rows) and not self.rows[k].fail:
+                    target = self.rows[k].track
+                    if self.project and self.project.track_of(blk.clip) and \
+                            self.project.track_of(blk.clip).name != target:
+                        self.clipMoved.emit(uid, target)
+        self._drag = None
+        self._drag_row = None
+        self._drop_row = None
+        self.update()
+
+    def keyPressEvent(self, ev) -> None:  # noqa: N802
+        if ev.key() in (Qt.Key_Delete, Qt.Key_Backspace) and self.selected is not None:
+            self.deleteRequested.emit()
+        else:
+            super().keyPressEvent(ev)
 
     def wheelEvent(self, ev) -> None:  # noqa: N802
         if ev.modifiers() & (Qt.ControlModifier | Qt.MetaModifier):
@@ -237,6 +520,34 @@ class TimelineCanvas(QWidget):
             ev.accept()
         else:
             ev.ignore()
+
+    # arrastar arquivos do Finder/Explorer
+    def dragEnterEvent(self, ev) -> None:  # noqa: N802
+        if ev.mimeData().hasUrls():
+            ev.acceptProposedAction()
+
+    def dragMoveEvent(self, ev) -> None:  # noqa: N802
+        if ev.mimeData().hasUrls():
+            k = self._row_at(ev.position().y())
+            self._drop_row = k if (k is not None and (k == len(self.rows) or
+                                                      not self.rows[k].fail)) else None
+            self.update()
+            ev.acceptProposedAction()
+
+    def dragLeaveEvent(self, _ev) -> None:  # noqa: N802
+        self._drop_row = None
+        self.update()
+
+    def dropEvent(self, ev) -> None:  # noqa: N802
+        paths = [u.toLocalFile() for u in ev.mimeData().urls() if u.isLocalFile()]
+        k = self._row_at(ev.position().y())
+        target = None
+        if k is not None and k < len(self.rows) and not self.rows[k].fail and self.rows:
+            target = self.rows[k].track
+        self._drop_row = None
+        self.update()
+        if paths:
+            self.filesDropped.emit(paths, target)
 
 
 class TimelineView(QScrollArea):
@@ -246,14 +557,19 @@ class TimelineView(QScrollArea):
         self.setWidget(self.canvas)
         self.setWidgetResizable(False)
         self.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        self.setStyleSheet("QScrollArea { background: #111111; border: none; }")
+        self.setStyleSheet("QScrollArea { background: #141414; border: none; }")
         self.horizontalScrollBar().valueChanged.connect(lambda _: self.canvas.update())
+        self.verticalScrollBar().valueChanged.connect(lambda _: self.canvas.update())
 
-    def set_project(self, project: Project) -> None:
-        self.canvas.set_project(project)
-        self.canvas.fit(self.viewport().width())
+    def set_project(self, project: Project, fps=None, fit: bool = True) -> None:
+        self.canvas.set_project(project, fps)
+        if fit or self.canvas._auto_fit:
+            self.canvas._auto_fit = True
+            self.canvas.fit(self.viewport().width())
 
     def resizeEvent(self, ev) -> None:  # noqa: N802
         super().resizeEvent(ev)
-        if self.canvas.width() < self.viewport().width():
-            self.canvas.resize(self.viewport().width(), self.canvas.height())
+        if self.canvas._auto_fit:
+            self.canvas.fit(self.viewport().width())
+        else:
+            self.canvas._relayout()

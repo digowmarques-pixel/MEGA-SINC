@@ -34,6 +34,9 @@ class Clip:
     drift: float = 0.0
     drift_reliable: bool = False
     confidence: float = 0.0
+    # transitório (não salvo no projeto): preparação e forma de onda
+    prep: float = field(default=0.0, repr=False, compare=False)
+    wave: Optional[object] = field(default=None, repr=False, compare=False)
 
     @property
     def name(self) -> str:

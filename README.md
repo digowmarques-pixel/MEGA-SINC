@@ -3,6 +3,10 @@
 Sincronização automática de **múltiplas câmeras e gravadores de áudio** pelo som —
 no estilo do PluralEyes e do Syncaila. Roda em **macOS** (Apple Silicon e Intel) e **Windows**.
 
+Fluxo em três passos — **＋ Adicionar mídia → ▶ Sincronizar → ⇪ Exportar timeline** — com
+timeline visual: cada câmera/gravador é uma faixa, cada clipe mostra a forma de onda e o
+progresso da preparação, e o próximo passo fica destacado em amarelo.
+
 Arraste as pastas do job, clique em **Sincronizar** e exporte a timeline pronta para
 **Premiere Pro**, **Final Cut Pro** ou **DaVinci Resolve** — ou gere novos vídeos já com o
 áudio do gravador.
