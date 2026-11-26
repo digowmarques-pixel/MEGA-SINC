@@ -7,3 +7,4 @@ vendor/
 test_media/
 .pytest_cache/
 *.megasinc
+*.zip
