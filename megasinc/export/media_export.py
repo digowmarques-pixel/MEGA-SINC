@@ -13,6 +13,7 @@ from ..project import Clip, Project
 from ..timeline import Corrected
 
 ProgressFn = Callable[[float, str], None]
+RAW_EXTS = {".braw", ".r3d"}   # o FFmpeg lê o áudio, mas não copia a imagem RAW
 
 
 def _run_ffmpeg(cmd: list[str], cancel: Optional[threading.Event]) -> None:
@@ -134,6 +135,11 @@ def export_replaced_audio(project: Project, master_track: str, out_dir: str,
     for k, v in enumerate(videos):
         if progress:
             progress(k / max(1, len(videos)), f"Exportando {v.name}")
+        if Path(v.path).suffix.lower() in RAW_EXTS:
+            if log:
+                log(f"✖ {v.name}: arquivos RAW ({Path(v.path).suffix}) não podem ser copiados "
+                    "pelo FFmpeg — use a exportação de XML/FCPXML para este clipe.")
+            continue
         v0, v1 = _span(v)
         best, best_ov = None, 0.0
         for m in masters:
