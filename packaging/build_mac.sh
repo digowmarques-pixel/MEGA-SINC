@@ -7,7 +7,9 @@ PY=${PYTHON:-python3}
 $PY -m venv .venv-build
 source .venv-build/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt pyinstaller pillow
+python -m pip install -r requirements.txt pyinstaller pillow certifi
+# evita erro de certificado SSL no Python do python.org ao baixar o FFmpeg
+export SSL_CERT_FILE="$(python -c 'import certifi; print(certifi.where())')"
 
 python packaging/fetch_ffmpeg.py
 pyinstaller packaging/megasinc.spec --noconfirm --clean
