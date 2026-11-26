@@ -67,8 +67,9 @@ powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
 O PyInstaller não faz build cruzado: o `.app` precisa ser gerado num Mac e o `.exe` num
 Windows. Para não depender disso, o repositório traz um workflow do **GitHub Actions**
 (`.github/workflows/build.yml`) que roda os testes e gera **DMG Apple Silicon, DMG Intel e
-instalador/ZIP do Windows** a cada push; criando uma tag `v1.0.0`, ele publica tudo numa
-Release.
+instalador/ZIP do Windows** a cada push na `main` e publica tudo na Release da versão
+atual (`v` + `__version__` de `megasinc/__init__.py`). Para lançar uma versão nova, aumente
+o `__version__`.
 
 > **macOS:** o app sai com assinatura ad-hoc. Na primeira vez, clique com o botão direito →
 > *Abrir* (ou rode `xattr -dr com.apple.quarantine "/Applications/Mega Sinc.app"`). Para
