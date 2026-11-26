@@ -1,0 +1,5 @@
+-r requirements.txt
+scipy>=1.10      # apenas para gerar mídia de teste
+pytest>=7
+pyinstaller>=6.3
+pillow>=10

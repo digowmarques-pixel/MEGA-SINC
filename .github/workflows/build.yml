@@ -1,0 +1,89 @@
+name: Build Mega Sinc
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg libegl1 libxkbcommon0
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -q
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-15, name: macOS-arm64 }         # Apple Silicon (M1–M4)
+          - { os: macos-15-intel, name: macOS-x86_64 }  # Mac Intel
+          - { os: windows-latest, name: Windows-x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: Dependências
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller pillow
+
+      - name: FFmpeg embutido
+        run: python packaging/fetch_ffmpeg.py
+
+      - name: PyInstaller
+        run: pyinstaller packaging/megasinc.spec --noconfirm --clean
+
+      - name: Teste rápido do executável (macOS)
+        if: runner.os == 'macOS'
+        run: '"dist/Mega Sinc.app/Contents/MacOS/MegaSinc" info'
+
+      - name: Teste rápido do executável (Windows)
+        if: runner.os == 'Windows'
+        run: dist\MegaSinc\megasinc-cli.exe info
+
+      - name: DMG (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --deep --sign - "dist/Mega Sinc.app" || true
+          mkdir -p stage && cp -R "dist/Mega Sinc.app" stage/ && ln -s /Applications stage/Applications
+          hdiutil create -volname "Mega Sinc" -srcfolder stage -ov -format UDZO "dist/MegaSinc-${{ matrix.name }}.dmg"
+
+      - name: ZIP + instalador (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = python -c "import megasinc; print(megasinc.__version__)"
+          Compress-Archive -Path dist\MegaSinc\* -DestinationPath "dist\MegaSinc-${{ matrix.name }}-portable.zip"
+          choco install innosetup -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" packaging\installer.iss
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MegaSinc-${{ matrix.name }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/*Setup*.exe
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions: { contents: write }
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
