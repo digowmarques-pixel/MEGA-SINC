@@ -452,24 +452,38 @@ def cache_key(path: str, sr: int = ANALYSIS_SR) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
-def _audio_input_args(info: MediaInfo) -> list[str]:
+def channel_count(info: MediaInfo) -> int:
+    """Canais selecionáveis: trilhas de áudio (se houver várias) ou canais da 1ª trilha."""
+    return info.audio_streams if info.audio_streams > 1 else max(1, info.audio_channels)
+
+
+def _audio_input_args(info: MediaInfo, channel: Optional[int] = None) -> list[str]:
+    """Argumentos de mapeamento de áudio. channel=None mistura tudo; channel=k (1..N)
+    usa só a trilha k (arquivos com várias trilhas) ou o canal k da 1ª trilha."""
+    if channel:
+        if info.audio_streams > 1:
+            k = min(channel, info.audio_streams) - 1
+            return ["-map", f"0:a:{k}", "-ac", "1"]
+        k = min(channel, max(1, info.audio_channels)) - 1
+        return ["-map", "0:a:0", "-af", f"pan=mono|c0=c{k}"]
     if info.audio_streams > 1:
         ins = "".join(f"[0:a:{i}]" for i in range(info.audio_streams))
         return ["-filter_complex",
                 f"{ins}amix=inputs={info.audio_streams}:duration=longest[aout]",
-                "-map", "[aout]"]
-    return ["-map", "0:a:0"]
+                "-map", "[aout]", "-ac", "1"]
+    return ["-map", "0:a:0", "-ac", "1"]
 
 
 def extract_pcm(info: MediaInfo, out_path: Path, sr: int = ANALYSIS_SR,
                 cancel: Optional[threading.Event] = None,
-                progress: Optional[Callable[[float], None]] = None) -> int:
+                progress: Optional[Callable[[float], None]] = None,
+                channel: Optional[int] = None) -> int:
     """Decodifica o áudio para PCM 16-bit mono em `out_path`. Retorna nº de amostras."""
     ffmpeg = require_ffmpeg()
     tmp = out_path.with_suffix(".part")
     cmd = [ffmpeg, "-nostdin", "-hide_banner", "-v", "error", "-i", info.path,
-           "-vn", "-sn", "-dn", *_audio_input_args(info),
-           "-ac", "1", "-ar", str(sr), "-c:a", "pcm_s16le", "-f", "s16le",
+           "-vn", "-sn", "-dn", *_audio_input_args(info, channel),
+           "-ar", str(sr), "-c:a", "pcm_s16le", "-f", "s16le",
            "-progress", "pipe:1", "-nostats", "-y", str(tmp)]
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, **_POPEN_KW)

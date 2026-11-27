@@ -86,6 +86,7 @@ class Clip:
 class Track:
     name: str
     clips: list[Clip] = field(default_factory=list)
+    audio_channel: Optional[int] = None    # None = mistura de todos os canais
 
     @property
     def has_video(self) -> bool:
@@ -263,7 +264,7 @@ class Project:
             "version": 1,
             "reference": self.reference,
             "tracks": [
-                {"name": t.name, "clips": [
+                {"name": t.name, "audio_channel": t.audio_channel, "clips": [
                     {"path": c.path, "status": c.status, "message": c.message,
                      "offset": c.offset, "drift": c.drift,
                      "drift_reliable": c.drift_reliable, "confidence": c.confidence,
@@ -277,7 +278,7 @@ class Project:
         p = cls()
         p.reference = d.get("reference")
         for td in d.get("tracks", []):
-            t = Track(td["name"])
+            t = Track(td["name"], audio_channel=td.get("audio_channel"))
             for cd in td.get("clips", []):
                 c = Clip(path=cd["path"])
                 c.status = cd.get("status", Status.PENDING)

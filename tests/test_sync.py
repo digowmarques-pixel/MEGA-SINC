@@ -104,3 +104,40 @@ def test_coarse_and_fine_on_noise():
     assert abs(cm.lag - lag) < 0.02
     fm = refine_match(x, y, cm.lag)
     assert abs(fm.lag - lag) < 1e-3
+
+
+def test_channel_selection(tmp_path):
+    """Canal 1 com ruído forte, canal 2 com o áudio útil: só o canal 2 sincroniza bem."""
+    from make_test_media import SR, speechlike
+    import wave
+    rng = np.random.default_rng(3)
+    master = speechlike(60.0, rng)
+    ref = tmp_path / "ref"
+    cam = tmp_path / "cam"
+    ref.mkdir()
+    cam.mkdir()
+
+    def write(path, chans):
+        data = np.stack([np.clip(c, -1, 1) for c in chans], axis=1)
+        with wave.open(str(path), "wb") as w:
+            w.setnchannels(len(chans))
+            w.setsampwidth(2)
+            w.setframerate(SR)
+            w.writeframes((data * 32767).astype("<i2").tobytes())
+
+    write(ref / "REC_0001.wav", [master])
+    seg = master[int(12.5 * SR): int(42.5 * SR)]
+    noise = rng.standard_normal(len(seg)).astype(np.float32) * 0.6
+    write(cam / "CAM_0001.wav", [noise, seg])
+
+    from megasinc.media import _audio_input_args, channel_count, probe as pr
+    info = pr(str(cam / "CAM_0001.wav"))
+    assert channel_count(info) == 2
+    assert "pan=mono|c0=c1" in _audio_input_args(info, 2)
+
+    p = Project()
+    p.add_paths([str(ref), str(cam)])
+    p.track("CAM").audio_channel = 2
+    SyncEngine(p, SyncOptions(cache_dir=tmp_path / "cache", timeline_clock="reference")).run()
+    c = p.track("CAM").clips[0]
+    assert c.is_synced and abs(c.offset - 12.5) < 0.002

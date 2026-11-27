@@ -23,7 +23,7 @@ from ..engine import SyncEngine, SyncOptions
 from ..export import (export_csv, export_drift_corrected, export_fcpxml, export_json,
                       export_replaced_audio, export_xmeml)
 from ..export.media_export import drift_candidates
-from ..media import (MEDIA_EXTS, default_cache_dir, describe_tools, find_tool, fps_label,
+from ..media import (MEDIA_EXTS, channel_count, default_cache_dir, describe_tools, find_tool, fps_label,
                      parse_fps_string, seconds_to_tc)
 from ..prepare import prepare_clip
 from ..project import GROUP_MODES, Project, Status
@@ -710,7 +710,9 @@ class MainWindow(QMainWindow):
                 if cancel.is_set():
                     return
                 try:
-                    prepare_clip(c, cache, cancel=cancel, progress=lambda _f: report())
+                    tr = self.project.track_of(c)
+                    prepare_clip(c, cache, cancel=cancel, progress=lambda _f: report(),
+                                 channel=tr.audio_channel if tr else None)
                 except Exception as e:  # noqa: BLE001
                     if cancel.is_set():
                         return
@@ -759,9 +761,32 @@ class MainWindow(QMainWindow):
         m = QMenu(self)
         m.addAction("★  Definir como referência", lambda: self._set_ref(name))
         m.addAction("Renomear…", lambda: self.on_rename_track(name))
+        t = self.project.track(name)
+        n_ch = max((channel_count(c.info) for c in t.clips if c.info and c.info.has_audio),
+                   default=0) if t else 0
+        if n_ch > 1:
+            cm = m.addMenu("Canal de áudio para análise")
+            opts = [(None, "Todos (mistura)")] + [(k, f"Canal {k}") for k in range(1, n_ch + 1)]
+            for val, label in opts:
+                a = cm.addAction(label, lambda v=val: self._set_channel(name, v))
+                a.setCheckable(True)
+                a.setChecked(t.audio_channel == val)
         m.addSeparator()
         m.addAction("Remover faixa", lambda: self._remove_track(name))
         m.exec(gpos)
+
+    def _set_channel(self, name: str, channel) -> None:
+        t = self.project.track(name)
+        if t is None or t.audio_channel == channel:
+            return
+        t.audio_channel = channel
+        for c in t.clips:
+            c.wave, c.prep = None, 0.0
+        self.project.reset_results()
+        self.log(f"Faixa {name}: análise pelo " + (f"canal {channel}." if channel else
+                                                    "áudio misturado."))
+        self.refresh()
+        self.prepare_pending()
 
     def on_clip_menu(self, uid: int, gpos) -> None:
         c = self.project.clip_by_uid(uid)

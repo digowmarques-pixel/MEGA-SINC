@@ -46,6 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--group", choices=list(GROUP_MODES), default="auto",
                    help="agrupamento automático das entradas soltas (padrão: auto)")
     s.add_argument("--reference", "-r", help="nome da faixa de referência")
+    s.add_argument("--channel", action="append", metavar="FAIXA=N",
+                   help="usa só o canal N do áudio da faixa na análise (ex.: --channel 'Cam A=2')")
     s.add_argument("--fps", help="quadros/s da timeline (ex.: 23.976, 25, 29.97). Padrão: auto")
     s.add_argument("--clock", choices=["video", "reference"], default="video",
                    help="relógio da timeline: câmeras (video) ou faixa de referência")
@@ -88,6 +90,13 @@ def run_sync(args) -> int:
             return 2
         project.reference = args.reference
 
+    for spec in args.channel or []:
+        name, _, n = spec.rpartition("=")
+        tr = project.track(name)
+        if tr is None or not n.isdigit():
+            print(f"--channel inválido: {spec}", file=sys.stderr)
+            return 2
+        tr.audio_channel = int(n)
     print("Faixas:")
     for t in project.tracks:
         print(f"  {t.name}: {len(t.clips)} arquivo(s)")

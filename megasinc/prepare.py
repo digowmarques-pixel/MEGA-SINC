@@ -35,8 +35,15 @@ def compute_waveform(pcm: np.ndarray, rate: int = WAVE_RATE) -> np.ndarray:
     return np.clip(out / ref, 0, 1).astype(np.float16)
 
 
+def cache_paths(clip: Clip, cache_dir: Path, channel: Optional[int] = None):
+    key = cache_key(clip.path) + (f"_c{channel}" if channel else "")
+    return (cache_dir / f"{key}.pcm", cache_dir / f"{key}.feat.npy",
+            cache_dir / f"{key}.wave.npy")
+
+
 def prepare_clip(clip: Clip, cache_dir: Path, cancel: Optional[threading.Event] = None,
-                 progress: Optional[Callable[[float], None]] = None):
+                 progress: Optional[Callable[[float], None]] = None,
+                 channel: Optional[int] = None):
     """Garante metadados, PCM, features e forma de onda do clipe.
     Retorna (pcm, features) — ou (None, None) se o arquivo não tem áudio."""
     if clip.info is None:
@@ -44,10 +51,7 @@ def prepare_clip(clip: Clip, cache_dir: Path, cancel: Optional[threading.Event] 
     if not clip.info.has_audio:
         clip.prep = 1.0
         return None, None
-    key = cache_key(clip.path)
-    pcm_path = cache_dir / f"{key}.pcm"
-    feat_path = cache_dir / f"{key}.feat.npy"
-    wave_path = cache_dir / f"{key}.wave.npy"
+    pcm_path, feat_path, wave_path = cache_paths(clip, cache_dir, channel)
 
     def rep(f: float) -> None:
         clip.prep = 0.9 * f
@@ -55,7 +59,7 @@ def prepare_clip(clip: Clip, cache_dir: Path, cancel: Optional[threading.Event] 
             progress(clip.prep)
 
     if not pcm_path.exists():
-        extract_pcm(clip.info, pcm_path, cancel=cancel, progress=rep)
+        extract_pcm(clip.info, pcm_path, cancel=cancel, progress=rep, channel=channel)
     else:
         os.utime(pcm_path)
     pcm = open_pcm(pcm_path)

@@ -400,7 +400,9 @@ class TimelineCanvas(QWidget):
         if len(fpss) == 1:
             info.append(f"{fps_label(next(iter(fpss)))} fps")
         chs = {c.info.audio_channels for c in t.clips if c.info and c.info.has_audio}
-        if len(chs) == 1:
+        if t.audio_channel:
+            info.append(f"análise: canal {t.audio_channel}")
+        elif len(chs) == 1:
             n = next(iter(chs))
             info.append(f"{n} canal" + ("is" if n != 1 else ""))
         p.setPen(DIM)

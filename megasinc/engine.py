@@ -176,7 +176,9 @@ class SyncEngine:
                 self.progress(p0 + (p1 - p0) * (k + 1) / len(todo), f"Metadados: {c.name}")
 
     def _analyze_one(self, c: Clip, report: Callable[[float], None]) -> None:
-        pcm, feat = prepare_clip(c, self.cache_dir, cancel=self.cancel, progress=report)
+        tr = self.project.track_of(c)
+        pcm, feat = prepare_clip(c, self.cache_dir, cancel=self.cancel, progress=report,
+                                 channel=tr.audio_channel if tr else None)
         if pcm is not None:
             self.pcm[c.uid] = pcm
             self.feat[c.uid] = feat
