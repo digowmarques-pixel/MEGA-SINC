@@ -20,7 +20,8 @@ ROOT = Path(__file__).resolve().parent.parent
 DEST = ROOT / "vendor" / "ffmpeg"
 
 WIN = ["https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
-       "ffmpeg-master-latest-win64-lgpl.zip"]
+       "ffmpeg-master-latest-win64-lgpl.zip",
+       "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"]
 MAC = "https://ffmpeg.martin-riedl.de/redirect/latest/macos/{arch}/{channel}/{tool}.zip"
 
 
@@ -49,7 +50,7 @@ def fetch_windows() -> None:
     for url in WIN:
         try:
             got = extract(download(url), {"ffmpeg.exe", "ffprobe.exe"})
-            if "ffmpeg.exe" in got:
+            if "ffmpeg.exe" in got and "ffprobe.exe" in got:
                 return
         except Exception as e:  # noqa: BLE001
             print(f"  falhou: {e}")
