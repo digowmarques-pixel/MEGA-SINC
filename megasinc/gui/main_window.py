@@ -190,6 +190,14 @@ class OptionsDialog(QDialog):
         self.ref.setCurrentIndex(max(0, self.ref.findData(win.project.reference))
                                  if win.project.reference else 0)
         form.addRow("Faixa de referência:", self.ref)
+        self.method = QComboBox()
+        self.method.addItem("Áudio", "audio")
+        self.method.addItem("Áudio + timecode (quando o áudio falhar)", "hybrid")
+        self.method.addItem("Somente timecode", "timecode")
+        self.method.setCurrentIndex(max(0, self.method.findData(o["method"])))
+        self.method.setToolTip("Timecode só funciona se as câmeras e o gravador estavam\n"
+                               "com o timecode sincronizado (jam sync) na gravação.")
+        form.addRow("Sincronizar por:", self.method)
         self.clock = QComboBox()
         self.clock.addItem("Câmeras (corrige o drift do áudio)", "video")
         self.clock.addItem("Faixa de referência", "reference")
@@ -221,6 +229,7 @@ class OptionsDialog(QDialog):
 
     def apply(self, win: "MainWindow") -> None:
         win.opts.update(group=self.group.currentData(), clock=self.clock.currentData(),
+                        method=self.method.currentData(),
                         fps=self.fps.currentText(), min_score=self.score.value(),
                         fcpxml_version=self.fcpx.currentText(),
                         same_track=self.same.isChecked())
@@ -476,6 +485,7 @@ class MainWindow(QMainWindow):
         self.opts = {
             "group": s.value("group", "auto"),
             "clock": s.value("clock", "video"),
+            "method": s.value("method", "audio"),
             "fps": s.value("fps", "Automático"),
             "min_score": float(s.value("min_score", SyncOptions.min_score)),
             "fcpxml_version": s.value("fcpxml_version", "1.10"),
@@ -869,7 +879,8 @@ class MainWindow(QMainWindow):
             return
         o = self.opts
         opts = SyncOptions(min_score=o["min_score"], compare_same_track=o["same_track"],
-                           timeline_clock=o["clock"], cache_dir=self.cache_dir)
+                           timeline_clock=o["clock"], method=o["method"],
+                           cache_dir=self.cache_dir)
         self.log("\n— Sincronização iniciada —")
 
         def work(progress, log, cancel):

@@ -141,3 +141,54 @@ def test_channel_selection(tmp_path):
     SyncEngine(p, SyncOptions(cache_dir=tmp_path / "cache", timeline_clock="reference")).run()
     c = p.track("CAM").clips[0]
     assert c.is_synced and abs(c.offset - 12.5) < 0.002
+
+
+def test_timecode_modes(tmp_path):
+    """Gravador com BWF 01:00:00:00, câmera Y (áudio útil, TC 01:00:20:00) e câmera X
+    (só ruído, TC 01:00:10:00). Híbrido: Y pelo áudio, X pelo timecode."""
+    import subprocess
+    import wave
+    from make_test_media import SR, speechlike
+    rng = np.random.default_rng(9)
+    master = speechlike(60.0, rng)
+    raw = tmp_path / "m.wav"
+    with wave.open(str(raw), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SR)
+        w.writeframes((np.clip(master, -1, 1) * 32767).astype("<i2").tobytes())
+    (tmp_path / "rec").mkdir()
+    (tmp_path / "camx").mkdir()
+    (tmp_path / "camy").mkdir()
+    ff = ["ffmpeg", "-v", "error", "-y"]
+    subprocess.run(ff + ["-i", str(raw), "-c:a", "pcm_s16le", "-write_bext", "1",
+                         "-metadata", f"time_reference={3600 * SR}",
+                         str(tmp_path / "rec" / "REC_0001.wav")], check=True)
+
+    def cam(path, tc, start, noise=False):
+        src = ["-f", "lavfi", "-i", "anoisesrc=d=20:a=0.3:r=48000"] if noise else \
+            ["-ss", str(start), "-t", "20", "-i", str(raw)]
+        subprocess.run(ff + ["-f", "lavfi", "-i", "testsrc2=size=160x90:rate=25:duration=20",
+                             *src, "-map", "0:v", "-map", "1:a", "-c:v", "libx264",
+                             "-preset", "ultrafast", "-c:a", "pcm_s16le", "-shortest",
+                             "-timecode", tc, str(path)], check=True)
+    cam(tmp_path / "camy" / "CAMY_0001.mov", "01:00:20:00", 20)
+    cam(tmp_path / "camx" / "CAMX_0001.mov", "01:00:10:00", 0, noise=True)
+
+    def run(method):
+        p = Project()
+        p.add_paths([str(tmp_path / d) for d in ("rec", "camx", "camy")])
+        SyncEngine(p, SyncOptions(method=method, timeline_clock="reference",
+                                  cache_dir=tmp_path / "cache")).run()
+        return {c.name.split("_")[0]: c for c in p.all_clips()}
+
+    a = run("audio")
+    assert a["CAMY"].is_synced and not a["CAMX"].is_synced
+    h = run("hybrid")
+    assert h["CAMX"].is_synced and h["CAMX"].message == "por timecode"
+    assert abs(h["CAMX"].offset - h["REC"].offset - 10.0) < 0.05
+    assert abs(h["CAMY"].offset - h["REC"].offset - 20.0) < 0.005
+    t = run("timecode")
+    assert all(c.is_synced for c in t.values())
+    assert abs(t["CAMY"].offset - t["REC"].offset - 20.0) < 1e-6
+    assert abs(t["CAMX"].offset - t["REC"].offset - 10.0) < 1e-6

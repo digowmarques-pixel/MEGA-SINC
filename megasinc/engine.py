@@ -38,6 +38,7 @@ class SyncOptions:
     compare_same_track: bool = False
     refine: bool = True
     timeline_clock: str = "video"   # "video" (câmeras) ou "reference"
+    method: str = "audio"           # "audio", "timecode" ou "hybrid" (áudio + timecode)
     workers: int = max(2, min(8, os.cpu_count() or 4))
     cache_dir: Optional[Path] = None
 
@@ -116,6 +117,23 @@ class SyncEngine:
             raise ValueError("Nenhum arquivo no projeto.")
 
         self._probe_all(clips, 0.0, 0.05)
+        if self.opt.method == "timecode":
+            self._apply_timecode(clips, only_missing=False)
+        else:
+            self._run_audio(clips, rep)
+            if self.opt.method == "hybrid":
+                self._apply_timecode(clips, only_missing=True)
+        rep.synced = sum(1 for c in clips if c.is_synced)
+        rep.unsynced = sum(1 for c in clips if c.status == Status.UNSYNCED)
+        rep.errors = sum(1 for c in clips if c.status == Status.ERROR)
+        self._check_overlaps(rep)
+        rep.elapsed = time.time() - t_start
+        self.progress(1.0, "Concluído")
+        self.log(f"Sincronizados: {rep.synced} | não sincronizados: {rep.unsynced} | "
+                 f"erros: {rep.errors} | {rep.elapsed:.1f} s")
+        return rep
+
+    def _run_audio(self, clips: list[Clip], rep: SyncReport) -> None:
         self._analyze_all(clips, 0.05, 0.55)
         usable = [c for c in clips if c.uid in self.feat and self.feat[c.uid].shape[1] > 0]
         for c in clips:
@@ -123,6 +141,8 @@ class SyncEngine:
                 c.status = Status.UNSYNCED
                 c.message = c.message or "sem áudio utilizável"
         if not usable:
+            if self.opt.method == "hybrid":
+                return
             raise ValueError("Nenhum clipe com áudio para analisar.")
 
         track_idx = {}
@@ -146,15 +166,60 @@ class SyncEngine:
             for c in usable:
                 c.status = Status.UNSYNCED
                 c.message = "nenhuma correspondência encontrada"
-        rep.synced = sum(1 for c in clips if c.is_synced)
-        rep.unsynced = sum(1 for c in clips if c.status == Status.UNSYNCED)
-        rep.errors = sum(1 for c in clips if c.status == Status.ERROR)
-        self._check_overlaps(rep)
-        rep.elapsed = time.time() - t_start
-        self.progress(1.0, "Concluído")
-        self.log(f"Sincronizados: {rep.synced} | não sincronizados: {rep.unsynced} | "
-                 f"erros: {rep.errors} | {rep.elapsed:.1f} s")
-        return rep
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def tc_start(c: Clip) -> Optional[float]:
+        """Início do clipe pelo timecode (vídeo) ou BWF (áudio), em segundos."""
+        i = c.info
+        if i is None:
+            return None
+        if (i.has_video and i.timecode and i.fps) or (not i.has_video and i.time_reference):
+            return float(i.start_seconds())
+        return None
+
+    def _apply_timecode(self, clips: list[Clip], only_missing: bool) -> None:
+        tcs = {c.uid: self.tc_start(c) for c in clips}
+        with_tc = [c for c in clips if c.status != Status.ERROR and tcs[c.uid] is not None]
+        delta: Optional[float] = None
+        if only_missing:
+            anchors = [c for c in clips if c.is_synced and tcs[c.uid] is not None]
+            targets = [c for c in with_tc if not c.is_synced]
+            if not targets:
+                return
+            if anchors:
+                d = np.array([c.offset - tcs[c.uid] for c in anchors])
+                delta = float(np.median(d))
+                spread = float(np.max(np.abs(d - delta)))
+                if spread > 0.1:
+                    self.log(f"Timecode não bate com o áudio (diferença de até {spread:.2f} s) — "
+                             "os clipes restantes NÃO foram posicionados por timecode.")
+                    return
+            elif any(c.is_synced for c in clips):
+                self.log("Nenhum clipe sincronizado pelo áudio tem timecode — não dá para "
+                         "combinar áudio e timecode.")
+                return
+        else:
+            targets = with_tc
+            for c in clips:
+                if c.status != Status.ERROR and tcs[c.uid] is None:
+                    c.status = Status.UNSYNCED
+                    c.message = "sem timecode"
+            if not targets:
+                raise ValueError("Nenhum arquivo tem timecode (ou BWF) para sincronizar.")
+        if delta is None:
+            delta = -min(tcs[c.uid] for c in targets)
+            ref = self.project.reference_track()
+            pool = [c for c in targets if ref and c in ref.clips] or targets
+            root = max(pool, key=lambda c: c.duration)
+        else:
+            root = None
+        for c in targets:
+            c.offset = tcs[c.uid] + delta
+            c.drift, c.drift_reliable, c.confidence = 0.0, False, 0.0
+            c.status = Status.REFERENCE if c is root else Status.SYNCED
+            c.message = "por timecode"
+        self.log(f"{len(targets)} clipe(s) posicionado(s) por timecode.")
 
     # ------------------------------------------------------------------
     def _probe_all(self, clips: list[Clip], p0: float, p1: float) -> None:
