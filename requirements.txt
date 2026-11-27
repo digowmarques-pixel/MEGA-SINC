@@ -1,3 +1,4 @@
 numpy>=1.24
 PySide6>=6.5
 imageio-ffmpeg>=0.4.9   # ffmpeg de reserva caso não haja um no sistema/pacote
+sounddevice>=0.4.6    # saída de áudio do player (inclui PortAudio no Mac/Windows)

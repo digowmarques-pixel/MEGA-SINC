@@ -88,6 +88,8 @@ class TimelineCanvas(QWidget):
     clipAdjusted = Signal(int, float, str)  # uid, novo início na timeline, faixa
                                             # ("" = mesma, "__new__" = nova faixa)
     nudgeRequested = Signal(int, int)       # uid, quadros (+/-)
+    seekRequested = Signal(float)           # segundos na timeline
+    mixChanged = Signal()                   # mudo/solo alterado
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -108,6 +110,10 @@ class TimelineCanvas(QWidget):
         self._press: Optional[tuple[Block, QPointF]] = None   # clipe e ponto do clique
         self._drag_active = False
         self.shift = 0.0         # deslocamento aplicado pela timeline
+        self.playhead: Optional[float] = None
+        self.muted: set[str] = set()
+        self.soloed: set[str] = set()
+        self._hdr_btns: list[tuple[QRectF, str, str]] = []
         self._drag_row: Optional[int] = None
         self._drop_row: Optional[int] = None
         self._auto_fit = True
@@ -272,7 +278,18 @@ class TimelineCanvas(QWidget):
                 continue
             self._paint_clip(p, rect, b, r, left, right, fm)
 
+        # cursor de reprodução
+        if self.playhead is not None and self.synced_mode:
+            xp = self.x_of(self.playhead)
+            p.setPen(QPen(QColor("#FFFFFF"), 2))
+            p.drawLine(QPointF(xp, RULER_H), QPointF(xp, self.height()))
+            p.setPen(Qt.NoPen)
+            p.setBrush(YELLOW)
+            p.drawPolygon(QPolygonF([QPointF(xp - 7, RULER_H - 12), QPointF(xp + 7, RULER_H - 12),
+                                     QPointF(xp, RULER_H)]))
+
         # cabeçalhos (fixos à esquerda)
+        self._hdr_btns = []
         p.fillRect(QRectF(left, 0, HEAD_W, self.height()), HEAD_BG)
         p.fillRect(QRectF(left, 0, HEAD_W, RULER_H), RULER_BG)
         p.setPen(YELLOW)
@@ -319,6 +336,23 @@ class TimelineCanvas(QWidget):
                 p.setPen(TEXT)
                 p.drawText(QRectF(pos.x() - 54, pos.y() - 18, 170, 36), Qt.AlignVCenter,
                            fm.elidedText(blk.clip.name, Qt.ElideRight, 165))
+
+    def active_tracks(self) -> Optional[set[str]]:
+        """Faixas audíveis no player (None = todas)."""
+        if self.soloed:
+            return set(self.soloed)
+        if self.muted:
+            return {r.track for r in self.rows if not r.fail} - self.muted
+        return None
+
+    def ensure_visible(self, t: float) -> None:
+        sa = self.parentWidget().parentWidget() if self.parentWidget() else None
+        if sa is None or not hasattr(sa, "horizontalScrollBar"):
+            return
+        vis = self.visibleRegion().boundingRect()
+        x = self.x_of(t)
+        if x > vis.right() - 60 or x < vis.left() + HEAD_W:
+            sa.horizontalScrollBar().setValue(int(max(0, x - HEAD_W - 80)))
 
     def _dragged_start(self, blk: Block, p0: QPointF, pos: QPointF) -> float:
         t = blk.start + (pos.x() - p0.x()) / self.px_per_s
@@ -426,8 +460,9 @@ class TimelineCanvas(QWidget):
         p.setFont(bf)
         p.setPen(TEXT)
         name = t.name + ("  ★" if is_ref else "")
-        p.drawText(QRectF(x + 60, r.y + 10, HEAD_W - 66, 24), Qt.AlignVCenter,
-                   p.fontMetrics().elidedText(name, Qt.ElideRight, HEAD_W - 70))
+        name_w = HEAD_W - (130 if self.synced_mode else 70)
+        p.drawText(QRectF(x + 60, r.y + 10, name_w, 24), Qt.AlignVCenter,
+                   p.fontMetrics().elidedText(name, Qt.ElideRight, name_w))
         p.setFont(self.font())
         info = [f"{len(t.clips)} clipe" + ("s" if len(t.clips) != 1 else "")]
         fpss = {c.info.fps for c in t.clips if c.info and c.info.fps}
@@ -442,6 +477,16 @@ class TimelineCanvas(QWidget):
         p.setPen(DIM)
         p.drawText(QRectF(x + 60, r.y + 34, HEAD_W - 66, 20), Qt.AlignVCenter,
                    p.fontMetrics().elidedText("  |  ".join(info), Qt.ElideRight, HEAD_W - 70))
+        if self.synced_mode:
+            for i, (kind, on_col) in enumerate((("M", RED), ("S", YELLOW))):
+                br = QRectF(x + HEAD_W - 60 + i * 26, r.y + 13, 22, 18)
+                on = r.track in (self.muted if kind == "M" else self.soloed)
+                p.setPen(QPen(on_col if on else QColor("#555"), 1))
+                p.setBrush(on_col if on else QColor("#222"))
+                p.drawRoundedRect(br, 3, 3)
+                p.setPen(QColor("#111") if on else DIM)
+                p.drawText(br, Qt.AlignCenter, kind)
+                self._hdr_btns.append((br, r.track, kind))
         if is_ref:
             p.setPen(YELLOW)
             p.drawText(QRectF(x + 60, r.y + 52, HEAD_W - 66, 16), Qt.AlignVCenter, "referência")
@@ -472,10 +517,20 @@ class TimelineCanvas(QWidget):
         pos = ev.position()
         self.setFocus()
         if self._in_header(pos):
+            for br, track, kind in self._hdr_btns:
+                if br.contains(pos) and ev.button() == Qt.LeftButton:
+                    group = self.muted if kind == "M" else self.soloed
+                    group.symmetric_difference_update({track})
+                    self.mixChanged.emit()
+                    self.update()
+                    return
             k = self._row_at(pos.y())
             if k is not None and k < len(self.rows) and not self.rows[k].fail and \
                     ev.button() == Qt.RightButton:
                 self.trackMenu.emit(self.rows[k].track, ev.globalPosition().toPoint())
+            return
+        if pos.y() < RULER_H and self.synced_mode:
+            self.seekRequested.emit(max(0.0, (pos.x() - HEAD_W) / self.px_per_s))
             return
         b = self._block_at(pos)
         self.selected = b.clip.uid if b else None

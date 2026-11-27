@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QSettings, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QDesktopServices, QFont, QKeySequence, QPainter
+from PySide6.QtGui import (QAction, QBrush, QColor, QDesktopServices, QFont, QKeySequence,
+                           QPainter, QShortcut)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox,
                                QComboBox, QDialog, QDialogButtonBox, QDockWidget,
                                QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout,
@@ -24,9 +25,10 @@ from ..export import (export_csv, export_drift_corrected, export_fcpxml,
                       export_fcpxml_multicam, export_json,
                       export_replaced_audio, export_xmeml)
 from ..export.media_export import drift_candidates
-from ..media import (MEDIA_EXTS, channel_count, default_cache_dir, describe_tools, find_tool, fps_label,
+from ..media import (MEDIA_EXTS, channel_count, default_cache_dir, open_pcm, describe_tools, find_tool, fps_label,
                      parse_fps_string, seconds_to_tc)
-from ..prepare import prepare_clip
+from ..player import Player, Source
+from ..prepare import cache_paths, prepare_clip
 from ..project import GROUP_MODES, Project, Status
 from ..timeline import build_timeline, guess_fps
 from .timeline_view import TimelineView
@@ -371,6 +373,16 @@ class MainWindow(QMainWindow):
         zoom.setObjectName("zoomBar")
         zl = QHBoxLayout(zoom)
         zl.setContentsMargins(12, 2, 12, 2)
+        self.btn_play = QPushButton("▶  Ouvir")
+        self.btn_play.setObjectName("playButton")
+        self.btn_play.setToolTip("Toca a timeline sincronizada (barra de espaço).\n"
+                                 "Use M (mudo) e S (solo) nas faixas para comparar.")
+        self.btn_play.clicked.connect(self.on_play_toggle)
+        zl.addWidget(self.btn_play)
+        self.time_label = QLabel("00:00:00:00")
+        self.time_label.setObjectName("timeLabel")
+        zl.addWidget(self.time_label)
+        zl.addSpacing(12)
         self.hint = QLabel("Arraste clipes para reagrupar ou ajustar a posição · ← → move 1 "
                            "quadro (Shift = 10) · Ctrl+Z desfaz · botão direito no nome da "
                            "faixa = opções · Ctrl + roda = zoom")
@@ -399,6 +411,14 @@ class MainWindow(QMainWindow):
         cv.clipSelected.connect(self.select_in_tree)
         cv.clipAdjusted.connect(self.on_clip_adjusted)
         cv.nudgeRequested.connect(self.on_nudge)
+        cv.seekRequested.connect(self.on_seek)
+        cv.mixChanged.connect(lambda: self.player.set_active(cv.active_tracks()))
+        self.player = Player()
+        self.play_timer = QTimer(self)
+        self.play_timer.setInterval(33)
+        self.play_timer.timeout.connect(self._on_play_tick)
+        sc = QShortcut(QKeySequence(Qt.Key_Space), self)
+        sc.activated.connect(self.on_play_toggle)
 
         self.strip = StatusStrip()
         self.strip.cancelRequested.connect(self.on_cancel)
@@ -520,6 +540,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("geometry", self.saveGeometry())
 
     def closeEvent(self, ev) -> None:  # noqa: N802
+        self.player.pause()
         if self.busy():
             self.task.cancel()
             self.task.wait(3000)
@@ -593,6 +614,8 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ refresh
     def refresh(self, fit: bool = False) -> None:
+        if self.player.playing:
+            self.player.pause()
         self.timeline.set_project(self.project, self.timeline_fps(), fit=fit)
         self._refresh_tree()
         clips = self.project.all_clips()
@@ -779,6 +802,61 @@ class MainWindow(QMainWindow):
             self.project.reset_results()
             self.log("Faixas alteradas — sincronize novamente.")
         self.refresh(fit=True)
+
+    # ---------------------------------------------------------------- player
+    def _play_sources(self) -> list:
+        cv = self.timeline.canvas
+        out = []
+        for b in cv.blocks:
+            if cv.rows[b.row].fail or not b.clip.has_audio:
+                continue
+            tr = self.project.track_of(b.clip)
+            pcm_path = cache_paths(b.clip, self.cache_dir, tr.audio_channel if tr else None)[0]
+            if pcm_path.exists():
+                out.append(Source(tr.name if tr else "", b.start, open_pcm(pcm_path)))
+        return out
+
+    def on_play_toggle(self) -> None:
+        cv = self.timeline.canvas
+        if self.player.playing:
+            self.player.pause()
+            return
+        if not cv.synced_mode or self.busy():
+            self.strip.idle("Sincronize primeiro para ouvir a timeline.")
+            return
+        ok, why = Player.available()
+        if not ok:
+            QMessageBox.warning(self, APP_NAME, f"Saída de áudio indisponível: {why}")
+            return
+        self.player.load(self._play_sources())
+        self.player.set_active(cv.active_tracks())
+        start = cv.playhead or 0.0
+        if start >= self.player.end - 0.05:
+            start = 0.0
+        self.player.seek(start)
+        try:
+            self.player.play()
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, APP_NAME, f"Não foi possível tocar o áudio: {e}")
+            return
+        self.play_timer.start()
+        self.btn_play.setText("❚❚  Pausar")
+
+    def on_seek(self, t: float) -> None:
+        self.player.seek(t)
+        self.timeline.canvas.playhead = t
+        self.time_label.setText(seconds_to_tc(t, self.timeline.canvas.fps))
+        self.timeline.canvas.update()
+
+    def _on_play_tick(self) -> None:
+        cv = self.timeline.canvas
+        cv.playhead = self.player.position
+        self.time_label.setText(seconds_to_tc(cv.playhead, cv.fps))
+        cv.ensure_visible(cv.playhead)
+        cv.update()
+        if not self.player.playing:
+            self.play_timer.stop()
+            self.btn_play.setText("▶  Ouvir")
 
     # ---------------------------------------------------------- ajuste manual
     def _snapshot(self, c) -> dict:
@@ -1204,6 +1282,11 @@ def apply_dark_theme(app: QApplication) -> None:
         QPushButton#zoomButton {{ background: #1f1f1f; border: 1px solid #333; border-radius: 4px;
                                   padding: 2px 8px; }}
         QPushButton#zoomButton:hover {{ border-color: {YELLOW}; color: {YELLOW}; }}
+        QPushButton#playButton {{ background: {YELLOW}; color: #111; font-weight: bold;
+                                  border: none; border-radius: 4px; padding: 3px 12px; }}
+        QPushButton#playButton:hover {{ background: #FFD54A; color: #111; }}
+        QLabel#timeLabel {{ color: {YELLOW}; font-family: Menlo, Consolas, monospace;
+                            font-size: 13px; padding-left: 8px; }}
         QPushButton#cancelButton {{ background: #111; color: #fff; border: 1px solid #555;
                                     border-radius: 4px; padding: 3px 12px; }}
         QPushButton#primaryButton {{ background: {YELLOW}; color: #111; font-weight: bold;

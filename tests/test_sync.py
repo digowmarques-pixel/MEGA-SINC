@@ -228,3 +228,21 @@ def test_multicam_and_mute(synced, tmp_path):
     f = ET.parse(tmp_path / "m.fcpxml").getroot()
     assert all(c.get("srcEnable") == "video" for c in f.findall(".//asset-clip")
                if "CAM" in c.get("name"))
+
+
+def test_player_mix_alignment():
+    """A mistura usa as posições da timeline: dois clipes do mesmo som, posicionados
+    certo, somam em fase (amplitude dobra / sqrt(2)); desalinhados, não."""
+    from megasinc.player import Source, render
+    rng = np.random.default_rng(1)
+    sr = 16000
+    x = (rng.standard_normal(sr * 10) * 4000).astype(np.int16)
+    a = Source("A", 0.0, x)
+    b = Source("B", 2.0, x[2 * sr:])           # mesmo som, começa 2 s depois
+    out = render([a, b], 5.0, 48000, 48000)[:, 0]
+    solo = render([a], 5.0, 48000, 48000)[:, 0]
+    assert np.allclose(out, solo * 2 / np.sqrt(2), atol=1e-3)
+    bad = render([a, Source("B", 2.05, x[2 * sr:])], 5.0, 48000, 48000)[:, 0]
+    assert not np.allclose(bad, solo * np.sqrt(2), atol=1e-2)
+    only_b = render([a, b], 5.0, 4800, 48000, active={"B"})[:, 0]
+    assert np.allclose(only_b, solo[:4800], atol=1e-3)

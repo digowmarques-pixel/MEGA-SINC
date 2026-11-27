@@ -35,6 +35,20 @@ Arraste as pastas do job, clique em **Sincronizar** e exporte a timeline pronta 
   - vídeos `.mov` com o áudio do gravador sincronizado (imagem sem recodificar,
     opcionalmente mantendo o áudio da câmera);
   - WAVs com drift corrigido; relatórios CSV/JSON.
+- **Player para conferir de ouvido**: ▶ Ouvir (ou barra de espaço) toca a timeline
+  mixando todas as faixas; botões **M** (mudo) e **S** (solo) em cada faixa; clique na régua
+  para posicionar. Microfones fora de sincronia soam com eco — sincronizados, somem.
+- **Ajuste manual**: depois de sincronizar, arraste clipes na horizontal (encaixa no quadro),
+  solte um clipe vermelho numa faixa para posicioná-lo à mão, use ← → para mover 1 quadro
+  (Shift = 10) e Ctrl+Z para desfazer.
+- **Sincronizar por timecode**: modos *Áudio*, *Somente timecode* e *Áudio + timecode*
+  (o timecode posiciona o que o áudio não conseguiu, se estiver coerente com o áudio).
+- **Canal de análise por faixa**: botão direito no nome da faixa → *Canal de áudio para
+  análise* (ex.: lapela só no canal 2 da câmera).
+- **Exportar multicâmera**: clipe multicâmera em FCPXML para Final Cut Pro e DaVinci Resolve
+  (cada câmera é um ângulo, áudio do gravador); para o Premiere, a sequência com uma câmera
+  por trilha vira multicâmera com *Multicâmera › Ativar*. Opção de silenciar o áudio das
+  câmeras.
 - Timecode embutido (MOV/MXF) e BWF são respeitados nos XMLs.
 - Projetos salvos em `.megasinc`. Cache de análise: re-sincronizar é instantâneo.
 

@@ -1,4 +1,4 @@
-## Mega Sinc 1.0.0
+## Mega Sinc 1.1.0
 
 Sincronização automática de múltiplas câmeras e gravadores pelo áudio.
 
@@ -7,12 +7,19 @@ Sincronização automática de múltiplas câmeras e gravadores pelo áudio.
 |---|---|
 | `MegaSinc-macOS-arm64.dmg` | Mac M1, M2, M3, M4 |
 | `MegaSinc-macOS-x86_64.dmg` | Mac Intel |
-| `MegaSinc-Setup-1.0.0.exe` | Windows (instalador) |
+| `MegaSinc-Setup-1.1.0.exe` | Windows (instalador) |
 | `MegaSinc-Windows-x64-portable.zip` | Windows (sem instalar) |
 
 ### Primeira abertura
 - **Mac:** abra o `.dmg`, arraste o Mega Sinc para Aplicativos e, na primeira vez, clique com o botão direito no app → **Abrir** → **Abrir**.
 - **Windows:** se o SmartScreen avisar, clique em **Mais informações → Executar assim mesmo**.
+
+### Novidades da 1.1
+- **Player**: ▶ Ouvir (barra de espaço) toca a timeline sincronizada; M (mudo) e S (solo) por faixa
+- **Ajuste manual**: arraste clipes na horizontal, posicione os vermelhos à mão, ← → move 1 quadro, Ctrl+Z desfaz
+- **Timecode**: sincronizar só por timecode ou áudio + timecode
+- **Canal de análise** por faixa (ex.: lapela no canal 2)
+- **Multicâmera**: clipe multicâmera para Final Cut Pro e DaVinci Resolve; opção de silenciar o áudio das câmeras
 
 ### Recursos
 - Agrupamento automático por câmera/gravador
