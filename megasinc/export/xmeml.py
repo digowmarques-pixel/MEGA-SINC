@@ -44,8 +44,10 @@ def _timecode(parent: ET.Element, fps: Fraction, frame: int, tc_str: str | None 
     _text(tc, "displayformat", "NDF")
 
 
-def export_xmeml(tl: Timeline, out_path: str) -> None:
+def export_xmeml(tl: Timeline, out_path: str, mute_camera_audio: bool = False) -> None:
     fps = Fraction(tl.fps)
+    mute = mute_camera_audio and any(not i.info.has_video and i.info.has_audio
+                                     for i in tl.items)
     root = ET.Element("xmeml", version="4")
     seq = ET.SubElement(root, "sequence", id="sequence-1")
     _text(seq, "name", tl.name)
@@ -192,6 +194,8 @@ def export_xmeml(tl: Timeline, out_path: str) -> None:
         for aid, ch in auds:
             parent = a_tracks[(it.track, it.lane, ch)]
             ci = base_clipitem(parent, aid, it, start, end, cin, cout)
+            if mute and it.info.has_video:          # só o áudio do gravador fica ativo
+                ci.find("enabled").text = "FALSE"
             add_file(ci, it)
             st = ET.SubElement(ci, "sourcetrack")
             _text(st, "mediatype", "audio")

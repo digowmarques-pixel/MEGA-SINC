@@ -192,3 +192,39 @@ def test_timecode_modes(tmp_path):
     assert all(c.is_synced for c in t.values())
     assert abs(t["CAMY"].offset - t["REC"].offset - 20.0) < 1e-6
     assert abs(t["CAMX"].offset - t["REC"].offset - 10.0) < 1e-6
+
+
+def test_multicam_and_mute(synced, tmp_path):
+    from fractions import Fraction
+    from megasinc.export import export_fcpxml_multicam
+
+    def sec(v):
+        return Fraction(v[:-1]) if v.endswith("s") else Fraction(v)
+
+    p, *_ = synced
+    tl = build_timeline(p)
+    export_fcpxml_multicam(tl, str(tmp_path / "mc.fcpxml"), audio_track="REC")
+    root = ET.parse(tmp_path / "mc.fcpxml").getroot()
+    mc = root.find(".//media/multicam")
+    angles = mc.findall("mc-angle")
+    assert [a.get("name") for a in angles] == ["CAMA", "CAMB", "REC"]
+    total = sec(root.find(".//project/sequence").get("duration"))
+    for a in angles:                      # storyline contínua: offset = soma das durações
+        cursor = Fraction(0)
+        for el in a:
+            assert sec(el.get("offset")) == cursor, (a.get("name"), el.attrib)
+            cursor += sec(el.get("duration"))
+        assert cursor == total
+    srcs = root.findall(".//project//mc-clip/mc-source")
+    assert {(s.get("angleID"), s.get("srcEnable")) for s in srcs} == {
+        ("angle-1", "video"), ("angle-3", "audio")}
+    # silenciar áudio das câmeras
+    export_xmeml(tl, str(tmp_path / "m.xml"), mute_camera_audio=True)
+    x = ET.parse(tmp_path / "m.xml").getroot()
+    states = {(c.find("name").text, c.find("enabled").text)
+              for c in x.findall(".//audio/track/clipitem")}
+    assert ("CAMB_0001.mov", "FALSE") in states and ("REC_0001.wav", "TRUE") in states
+    export_fcpxml(tl, str(tmp_path / "m.fcpxml"), mute_camera_audio=True)
+    f = ET.parse(tmp_path / "m.fcpxml").getroot()
+    assert all(c.get("srcEnable") == "video" for c in f.findall(".//asset-clip")
+               if "CAM" in c.get("name"))

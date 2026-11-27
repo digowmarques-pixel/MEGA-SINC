@@ -13,7 +13,8 @@ from pathlib import Path
 
 from . import APP_NAME, __version__
 from .engine import SyncEngine, SyncOptions
-from .export import (export_csv, export_drift_corrected, export_fcpxml, export_json,
+from .export import (export_csv, export_drift_corrected, export_fcpxml,
+                     export_fcpxml_multicam, export_json,
                      export_replaced_audio, export_xmeml)
 from .media import Cancelled, describe_tools, parse_fps_string
 from .project import GROUP_MODES, Project, Status
@@ -60,6 +61,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--fcpxml", help="exporta FCPXML (Final Cut / DaVinci)")
     s.add_argument("--fcpxml-version", default="1.10", choices=["1.8", "1.9", "1.10", "1.11"])
     s.add_argument("--xml", help="exporta XML FCP7 (Premiere / DaVinci)")
+    s.add_argument("--multicam", metavar="ARQ.fcpxml",
+                   help="exporta clipe multicâmera (Final Cut Pro / DaVinci Resolve)")
+    s.add_argument("--mute-camera-audio", action="store_true",
+                   help="desativa o áudio das câmeras nos XMLs (fica só o do gravador)")
     s.add_argument("--csv", help="exporta relatório CSV")
     s.add_argument("--json", help="exporta relatório JSON")
     s.add_argument("--drift-fix", metavar="PASTA",
@@ -138,11 +143,17 @@ def run_sync(args) -> int:
         sys.stderr.write("\n")
     tl = build_timeline(project, fps, args.name, corrected, args.include_unsynced)
     if args.fcpxml:
-        export_fcpxml(tl, args.fcpxml, version=args.fcpxml_version)
+        export_fcpxml(tl, args.fcpxml, version=args.fcpxml_version,
+                      mute_camera_audio=args.mute_camera_audio)
         print(f"FCPXML: {args.fcpxml}")
     if args.xml:
-        export_xmeml(tl, args.xml)
+        export_xmeml(tl, args.xml, mute_camera_audio=args.mute_camera_audio)
         print(f"XML (Premiere/FCP7): {args.xml}")
+    if args.multicam:
+        ref = project.reference_track()
+        export_fcpxml_multicam(tl, args.multicam, version=args.fcpxml_version,
+                               audio_track=ref.name if ref and not ref.has_video else None)
+        print(f"Multicâmera (FCPXML): {args.multicam}")
     if args.csv:
         export_csv(project, args.csv, tl.fps)
         print(f"CSV: {args.csv}")

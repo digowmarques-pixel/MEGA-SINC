@@ -20,7 +20,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QC
 
 from .. import APP_NAME, __version__
 from ..engine import SyncEngine, SyncOptions
-from ..export import (export_csv, export_drift_corrected, export_fcpxml, export_json,
+from ..export import (export_csv, export_drift_corrected, export_fcpxml,
+                      export_fcpxml_multicam, export_json,
                       export_replaced_audio, export_xmeml)
 from ..export.media_export import drift_candidates
 from ..media import (MEDIA_EXTS, channel_count, default_cache_dir, describe_tools, find_tool, fps_label,
@@ -237,9 +238,13 @@ class OptionsDialog(QDialog):
 
 
 EXPORT_TARGETS = [
-    ("premiere", "Adobe Premiere Pro", "XML — no Premiere: Arquivo → Importar"),
-    ("fcpx", "Final Cut Pro", "FCPXML — no Final Cut: Arquivo → Importar → XML"),
-    ("resolve", "DaVinci Resolve", "FCPXML — no Resolve: File → Import → Timeline"),
+    ("premiere", "Adobe Premiere Pro",
+     "XML → Arquivo › Importar. Multicâmera: arraste a sequência importada para uma nova\n"
+     "sequência, clique com o botão direito no clipe › Multicâmera › Ativar."),
+    ("multicam", "Final Cut Pro / DaVinci Resolve — clipe multicâmera",
+     "Cada câmera vira um ângulo, com o áudio do gravador. Pronto para cortar."),
+    ("fcpx", "Final Cut Pro — timeline", "FCPXML → Arquivo › Importar › XML"),
+    ("resolve", "DaVinci Resolve — timeline", "FCPXML → File › Import › Timeline"),
     ("media", "Vídeos com o áudio do gravador", "Novos .mov já sincronizados (sem recodificar)"),
     ("csv", "Relatório (planilha CSV)", "Lista com posições, confiança e drift"),
 ]
@@ -266,8 +271,11 @@ class ExportDialog(QDialog):
         self.drift = QCheckBox("Corrigir drift do áudio (recomendado em gravações > 10 min)")
         self.drift.setChecked(win.settings.value("drift_fix", "false") == "true")
         self.unsynced = QCheckBox("Incluir os não sincronizados no fim da timeline")
+        self.mute = QCheckBox("Silenciar o áudio das câmeras (usar só o do gravador)")
+        self.mute.setChecked(win.settings.value("mute_camera_audio", "false") == "true")
         lay.addSpacing(6)
         lay.addWidget(self.drift)
+        lay.addWidget(self.mute)
         lay.addWidget(self.unsynced)
         bb = QDialogButtonBox(QDialogButtonBox.Cancel)
         ok = bb.addButton("Exportar…", QDialogButtonBox.AcceptRole)
@@ -447,6 +455,8 @@ class MainWindow(QMainWindow):
             m.addAction("Premiere Pro (XML)…", lambda: self.do_export("premiere")),
             m.addAction("Final Cut Pro (FCPXML)…", lambda: self.do_export("fcpx")),
             m.addAction("DaVinci Resolve (FCPXML)…", lambda: self.do_export("resolve")),
+            m.addAction("Clipe multicâmera — Final Cut / Resolve…",
+                        lambda: self.do_export("multicam")),
             m.addAction("Vídeos com áudio do gravador…", lambda: self.do_export("media")),
             m.addAction("Somente WAVs com drift corrigido…", self.on_export_drift_only),
             m.addAction("Relatório CSV…", lambda: self.do_export("csv")),
@@ -905,22 +915,34 @@ class MainWindow(QMainWindow):
         target = dlg.target()
         self.settings.setValue("export_target", target)
         self.settings.setValue("drift_fix", "true" if dlg.drift.isChecked() else "false")
-        self.do_export(target, dlg.drift.isChecked(), dlg.unsynced.isChecked())
+        self.settings.setValue("mute_camera_audio", "true" if dlg.mute.isChecked() else "false")
+        self.do_export(target, dlg.drift.isChecked(), dlg.unsynced.isChecked(),
+                       dlg.mute.isChecked())
 
     def do_export(self, target: str, drift: Optional[bool] = None,
-                  unsynced: bool = False) -> None:
+                  unsynced: bool = False, mute: Optional[bool] = None) -> None:
         if drift is None:
             drift = self.settings.value("drift_fix", "false") == "true"
+        if mute is None:
+            mute = self.settings.value("mute_camera_audio", "false") == "true"
+        ver = self.opts["fcpxml_version"]
         if target == "premiere":
             path = self._save_path("Exportar para o Premiere Pro", ".xml", "XML (*.xml)")
             if path:
-                self._export_timeline(export_xmeml, path, drift, unsynced)
+                self._export_timeline(lambda tl, p: export_xmeml(tl, p, mute_camera_audio=mute),
+                                      path, drift, unsynced)
         elif target in ("fcpx", "resolve"):
             path = self._save_path("Exportar FCPXML", ".fcpxml", "FCPXML (*.fcpxml)")
             if path:
-                ver = self.opts["fcpxml_version"]
-                self._export_timeline(lambda tl, p: export_fcpxml(tl, p, version=ver), path,
-                                      drift, unsynced)
+                self._export_timeline(lambda tl, p: export_fcpxml(
+                    tl, p, version=ver, mute_camera_audio=mute), path, drift, unsynced)
+        elif target == "multicam":
+            path = self._save_path("Exportar clipe multicâmera", ".fcpxml", "FCPXML (*.fcpxml)")
+            if path:
+                ref = self.project.reference_track()
+                audio = ref.name if ref and not ref.has_video else None
+                self._export_timeline(lambda tl, p: export_fcpxml_multicam(
+                    tl, p, version=ver, audio_track=audio), path, drift, False)
         elif target == "media":
             self.on_export_replace()
         elif target == "csv":
