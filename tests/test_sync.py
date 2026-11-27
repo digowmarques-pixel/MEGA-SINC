@@ -246,3 +246,33 @@ def test_player_mix_alignment():
     assert not np.allclose(bad, solo * np.sqrt(2), atol=1e-2)
     only_b = render([a, b], 5.0, 4800, 48000, active={"B"})[:, 0]
     assert np.allclose(only_b, solo[:4800], atol=1e-3)
+
+
+def test_two_cameras_no_recorder(tmp_path):
+    """Caso real: duas câmeras, muitos clipes curtos, música repetitiva, sem gravador.
+    O horário de gravação descarta correspondências falsas e posiciona os grupos;
+    todo par de clipes que gravou junto deve ficar sincronizado (erro < 20 ms)."""
+    import json
+    from make_event_media import main as make_event
+    truth = make_event(str(tmp_path / "ev"), total=900.0, seed=11, video=False)
+    p = Project()
+    p.add_paths([str(tmp_path / "ev" / "P"), str(tmp_path / "ev" / "Q")])
+    SyncEngine(p, SyncOptions(cache_dir=tmp_path / "cache",
+                              timeline_clock="reference")).run()
+    clips = {f"{Path(c.path).parent.name}/{c.name}": c for c in p.all_clips()}
+    pairs = 0
+    for a, ca in clips.items():
+        for b, cb in clips.items():
+            ta, tb = truth[a], truth[b]
+            ov = min(ta["start"] + ta["dur"], tb["start"] + tb["dur"]) - \
+                max(ta["start"], tb["start"])
+            if a < b and a[0] != b[0] and ov > 3.0:
+                pairs += 1
+                assert ca.is_synced and cb.is_synced, (a, b)
+                err = (cb.placement() - ca.placement()) - (tb["start"] - ta["start"])
+                assert abs(err) < 0.02, (a, b, err)
+    assert pairs >= 4
+    # nenhum par da mesma câmera pode ficar sobreposto
+    for t in p.tracks:
+        s = sorted((c.placement(), c.placement() + c.duration) for c in t.clips if c.is_synced)
+        assert all(b0 >= a1 - 1.0 for (a0, a1), (b0, b1) in zip(s, s[1:]))

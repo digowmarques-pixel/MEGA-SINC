@@ -54,6 +54,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="relógio da timeline: câmeras (video) ou faixa de referência")
     s.add_argument("--method", choices=["audio", "timecode", "hybrid"], default="audio",
                    help="sincronizar por áudio, timecode ou ambos (hybrid)")
+    s.add_argument("--no-clock", action="store_true",
+                   help="não usar o horário de gravação das câmeras")
     s.add_argument("--same-track", action="store_true", help="compara clipes da mesma faixa")
     s.add_argument("--min-score", type=float, default=SyncOptions.min_score,
                    help="limiar de confiança (padrão: %(default)s)")
@@ -108,7 +110,8 @@ def run_sync(args) -> int:
     for t in project.tracks:
         print(f"  {t.name}: {len(t.clips)} arquivo(s)")
     opts = SyncOptions(min_score=args.min_score, compare_same_track=args.same_track,
-                       timeline_clock=args.clock, method=args.method)
+                       timeline_clock=args.clock, method=args.method,
+                       use_clock=not args.no_clock)
     cancel = threading.Event()
     eng = SyncEngine(project, opts, progress=_progress_printer(),
                      log=lambda m: print("\n" + m, file=sys.stderr), cancel=cancel)

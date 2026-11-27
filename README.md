@@ -35,6 +35,10 @@ Arraste as pastas do job, clique em **Sincronizar** e exporte a timeline pronta 
   - vídeos `.mov` com o áudio do gravador sincronizado (imagem sem recodificar,
     opcionalmente mantendo o áudio da câmera);
   - WAVs com drift corrigido; relatórios CSV/JSON.
+- **Duas ou mais câmeras sem gravador**: o horário de gravação de cada câmera (metadado do
+  arquivo) é usado para descartar correspondências falsas, fazer uma busca guiada em janela
+  estreita e posicionar grupos de clipes que só se sobrepõem entre si. Clipes sem nenhum áudio
+  em comum ficam listrados, no lugar indicado pelo horário.
 - **Player para conferir de ouvido**: ▶ Ouvir (ou barra de espaço) toca a timeline
   mixando todas as faixas; botões **M** (mudo) e **S** (solo) em cada faixa; clique na régua
   para posicionar. Microfones fora de sincronia soam com eco — sincronizados, somem.

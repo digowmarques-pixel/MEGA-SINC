@@ -112,7 +112,9 @@ class CoarseMatch:
     overlap: float    # segundos de sobreposição no pico
 
 
-def coarse_match(fa: np.ndarray, fb: np.ndarray, min_overlap_s: float = 3.0) -> Optional[CoarseMatch]:
+def coarse_match(fa: np.ndarray, fb: np.ndarray, min_overlap_s: float = 3.0,
+                 lag_window: Optional[tuple[float, float]] = None) -> Optional[CoarseMatch]:
+    """`lag_window=(min, max)` em segundos restringe a busca (busca guiada)."""
     nb_a, na = fa.shape
     nbb = fb.shape[1]
     if na < 20 or nbb < 20:
@@ -125,6 +127,9 @@ def coarse_match(fa: np.ndarray, fb: np.ndarray, min_overlap_s: float = 3.0) -> 
     overlap = np.minimum(na, lags + nbb) - np.maximum(0, lags)
     min_ov = max(10, min(int(min_overlap_s * FRAME_RATE), int(0.8 * min(na, nbb))))
     valid = overlap >= min_ov
+    if lag_window is not None:
+        lo, hi = lag_window
+        valid &= (lags >= lo * FRAME_RATE) & (lags <= hi * FRAME_RATE)
     if valid.sum() < 10:
         return None
     z = np.full(cc.shape, -np.inf)

@@ -244,6 +244,9 @@ class MediaInfo:
     model: str = ""
     # início do áudio em relação ao início do vídeo dentro do arquivo (s)
     audio_delay: float = 0.0
+    # horário de início da gravação (epoch, s) e de onde veio: "meta" ou "file"
+    created: Optional[float] = None
+    created_src: str = ""
 
     def start_seconds(self) -> Fraction:
         """Início da mídia segundo o timecode/BWF embutido (0 se não houver)."""
@@ -304,6 +307,39 @@ def _bits_from_fmt(fmt: str, codec: str) -> int:
     if "s24" in (fmt or ""):
         return 24
     return 16
+
+
+def parse_datetime(text: str) -> Optional[float]:
+    """'2026-11-20T15:32:10.000000Z' / '2026-11-20 15:32:10' / com fuso -> epoch."""
+    from datetime import datetime, timezone
+    t = (text or "").strip()
+    if not t:
+        return None
+    t = t.replace("Z", "+00:00")
+    t = re.sub(r"([+-]\d\d)(\d\d)$", r"\1:\2", t)          # -0300 -> -03:00
+    try:
+        dt = datetime.fromisoformat(t.replace(" ", "T", 1))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    if dt.year < 1990:                                        # relógio da câmera não ajustado
+        return None
+    return dt.timestamp()
+
+
+def _fill_created(info: "MediaInfo", meta_text: Optional[str]) -> None:
+    """Horário de início: metadado da câmera; senão, data de modificação do arquivo
+    menos a duração (a câmera grava o arquivo ao terminar)."""
+    t = parse_datetime(meta_text) if meta_text else None
+    if t is not None:
+        info.created, info.created_src = t, "meta"
+        return
+    try:
+        info.created = os.path.getmtime(info.path) - info.duration
+        info.created_src = "file"
+    except OSError:
+        pass
 
 
 def _float(v) -> Optional[float]:
@@ -368,6 +404,8 @@ def _probe_ffprobe(ffprobe: str, path: str) -> MediaInfo:
     tr = ftags.get("time_reference")
     if tr and str(tr).isdigit():
         info.time_reference = int(tr)
+    _fill_created(info, ftags.get("com.apple.quicktime.creationdate")
+                  or ftags.get("creation_time") or ftags.get("date"))
     info.make = ftags.get("com.apple.quicktime.make") or ftags.get("make") or ""
     info.model = ftags.get("com.apple.quicktime.model") or ftags.get("model") or ""
     if not info.has_video and not info.has_audio:
@@ -415,6 +453,8 @@ def _probe_ffmpeg(ffmpeg: str, path: str) -> MediaInfo:
     tm = re.search(r"timecode\s*:\s*(\d\d[:;]\d\d[:;]\d\d[:;.,]\d\d)", text)
     if tm:
         info.timecode = tm.group(1)
+    cm = re.search(r"(?:creationdate|creation_time)\s*:\s*(\S+)", text)
+    _fill_created(info, cm.group(1) if cm else None)
     trm = re.search(r"time_reference\s*:\s*(\d+)", text)
     if trm:
         info.time_reference = int(trm.group(1))

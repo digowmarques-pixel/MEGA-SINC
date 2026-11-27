@@ -8,7 +8,7 @@ from typing import Optional
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QPolygonF
+from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import QScrollArea, QToolTip, QWidget
 
 from ..media import fps_label, seconds_to_tc
@@ -399,9 +399,15 @@ class TimelineCanvas(QWidget):
                 p.setBrush(wave_col)
                 p.drawPolygon(QPolygonF(pts))
 
+        if c.estimated and not row.fail:          # posição só pelo horário: listrado
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(QColor(0, 0, 0, 70), Qt.BDiagPattern))
+            p.drawPath(path)
+
         # texto: nome | duração | estado
         if rect.width() > 40:
-            state = {Status.SYNCED: "sincronizado", Status.REFERENCE: "★ referência",
+            state = {Status.SYNCED: "pelo horário" if c.estimated else "sincronizado",
+                     Status.REFERENCE: "★ referência",
                      Status.UNSYNCED: "✖ não sincronizado", Status.ERROR: "✖ erro"}.get(c.status)
             if state is None:
                 state = "pronto" if c.prep >= 1.0 else ("preparando" if c.prep > 0 else "na fila")
@@ -580,6 +586,8 @@ class TimelineCanvas(QWidget):
                 lines.append(f"Confiança: {c.confidence:.0f}")
             if c.drift_reliable and abs(c.drift) > 5e-7:
                 lines.append(f"Drift: {c.drift * 1e6:+.1f} ppm")
+        if c.message and c.status in (Status.SYNCED, Status.REFERENCE):
+            lines.append(f"<i>{c.message}</i>")
         if c.status in (Status.UNSYNCED, Status.ERROR):
             lines.append(f"<span style='color:#FF4D4D'><b>✖ {c.status.upper()}</b>"
                          f"{': ' + c.message if c.message else ''}</span>")

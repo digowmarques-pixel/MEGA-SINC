@@ -39,6 +39,9 @@ class SyncOptions:
     refine: bool = True
     timeline_clock: str = "video"   # "video" (câmeras) ou "reference"
     method: str = "audio"           # "audio", "timecode" ou "hybrid" (áudio + timecode)
+    use_clock: bool = True          # usar o horário de gravação das câmeras
+    guided_score: float = 6.0       # limiar da busca guiada (janela estreita)
+    clock_tolerance: float = 3.0    # s: diferença aceita entre relógio e áudio
     workers: int = max(2, min(8, os.cpu_count() or 4))
     cache_dir: Optional[Path] = None
 
@@ -158,6 +161,11 @@ class SyncEngine:
                  if same_track or track_idx[usable[a].uid] != track_idx[usable[b].uid]]
         rep.edges_tested = len(pairs)
         edges = self._coarse_all(usable, pairs, 0.55, 0.80)
+        self._usable = usable
+        self._track_idx = track_idx
+        self._side_groups = []
+        if self.opt.use_clock:
+            edges = self._clock_filter(usable, edges, track_idx)
 
         ref_track = self.project.reference_track()
         ref_uids = {c.uid for c in ref_track.clips} if ref_track else set()
@@ -166,6 +174,8 @@ class SyncEngine:
             for c in usable:
                 c.status = Status.UNSYNCED
                 c.message = "nenhuma correspondência encontrada"
+        elif self.opt.use_clock:
+            self._clock_pass(usable, track_idx)
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -318,24 +328,55 @@ class SyncEngine:
         return edges
 
     # ------------------------------------------------------------------
-    @staticmethod
-    def _spanning_forest(n: int, edges: list[Edge]) -> list[Edge]:
+    def _spanning_forest(self, n: int, edges: list[Edge]) -> list[Edge]:
+        """Árvore geradora de máxima confiança que recusa ligações impossíveis:
+        dois clipes da mesma câmera não podem se sobrepor."""
+        usable = getattr(self, "_usable", None)
+        tidx = getattr(self, "_track_idx", {})
         parent = list(range(n))
+        members = {k: [k] for k in range(n)}
+        rel = [0.0] * n                    # posição relativa à raiz do grupo
 
         def find(x: int) -> int:
             while parent[x] != x:
-                parent[x] = parent[parent[x]]
                 x = parent[x]
             return x
 
         tree = []
-        # prioridade: refinada > drift confiável > pontuação
+        rejected = 0
         for e in sorted(edges, key=lambda e: (e.refined, e.drift_ok, e.score), reverse=True):
             ri, rj = find(e.i), find(e.j)
-            if ri != rj:
-                parent[ri] = rj
-                tree.append(e)
+            if ri == rj:
+                continue
+            shift = rel[e.i] + e.lag - rel[e.j]      # posições do grupo de j no grupo de i
+            if usable is not None and self._groups_conflict(members[ri], members[rj], rel,
+                                                            shift, usable, tidx):
+                rejected += 1
+                continue
+            for m in members[rj]:
+                rel[m] += shift
+                parent[m] = ri
+            members[ri] += members.pop(rj)
+            parent[rj] = ri
+            tree.append(e)
+        if rejected:
+            self.log(f"{rejected} correspondência(s) recusada(s): sobreporiam clipes da "
+                     "mesma câmera.")
         return tree
+
+    @staticmethod
+    def _groups_conflict(a, b, rel, shift, usable, tidx, tol: float = 1.0) -> bool:
+        by_track: dict[int, list[tuple[float, float]]] = defaultdict(list)
+        for m in a:
+            by_track[tidx.get(usable[m].uid, -1)].append((rel[m], rel[m] + usable[m].duration))
+        for m in b:
+            t = tidx.get(usable[m].uid, -1)
+            s0 = rel[m] + shift
+            s1 = s0 + usable[m].duration
+            for x0, x1 in by_track.get(t, ()):
+                if min(s1, x1) - max(s0, x0) > tol:
+                    return True
+        return False
 
     @staticmethod
     def _propagate(n: int, tree: list[Edge], roots: list[int]):
@@ -490,6 +531,12 @@ class SyncEngine:
                 c.message = ("sincroniza só com outros clipes isolados" if k in pos and
                              any(comp[m] == comp[k] for m in pos if m != k)
                              else "nenhuma correspondência encontrada")
+        groups: dict[int, list[int]] = defaultdict(list)
+        for k in pos:
+            if k not in main_comp:
+                groups[comp[k]].append(k)
+        self._side_groups = [(mem, {m: float(pos[m]) for m in mem})
+                             for mem in groups.values() if len(mem) > 1]
         return True
 
     @staticmethod
@@ -516,6 +563,198 @@ class SyncEngine:
         sol, *_ = np.linalg.lstsq(a, b - a @ x0, rcond=None)
         x = x0 + sol
         return {k: float(x[idx[k]]) for k in keys}
+
+    # ------------------------------------------------------------------
+    # Relógio das câmeras (horário de gravação)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _created(c: Clip) -> Optional[float]:
+        return c.info.created if c.info else None
+
+    @staticmethod
+    def _pcm_start(c: Clip) -> float:
+        delay = c.info.audio_delay if (c.info and c.info.has_video) else 0.0
+        return c.offset + (1.0 + c.drift) * delay
+
+    def _clock_filter(self, usable: list[Clip], edges: list[Edge], tidx) -> list[Edge]:
+        """A diferença entre os relógios de duas câmeras é constante: ligações
+        verdadeiras concordam nela; as falsas (música repetida, ruído) não."""
+        tol = self.opt.clock_tolerance
+        by_pair: dict[tuple[int, int], list[tuple[Edge, float]]] = defaultdict(list)
+        keep: list[Edge] = []
+        for e in edges:
+            ci, cj = self._created(usable[e.i]), self._created(usable[e.j])
+            ti, tj = tidx[usable[e.i].uid], tidx[usable[e.j].uid]
+            if ci is None or cj is None or ti == tj:
+                keep.append(e)
+                continue
+            v = (cj - ci) - e.lag             # relógio(Tj) - relógio(Ti)
+            key = (ti, tj) if ti < tj else (tj, ti)
+            by_pair[key].append((e, v if ti < tj else -v))
+        dropped = 0
+        for key, lst in by_pair.items():
+            vals = np.array([v for _, v in lst])
+            w = np.array([e.score for e, _ in lst])
+            support = np.array([w[np.abs(vals - v) <= tol].sum() for v in vals])
+            center = vals[int(np.argmax(support))]
+            near = np.abs(vals - center) <= tol
+            if len(lst) >= 2 and near.sum() < 2:
+                keep += [e for e, _ in lst]          # sem consenso: não dá para julgar
+                continue
+            consensus = float(np.median(vals[near]))
+            for (e, v) in lst:
+                if abs(v - consensus) <= tol:
+                    keep.append(e)
+                else:
+                    dropped += 1
+        if dropped:
+            self.log(f"{dropped} correspondência(s) descartada(s) por não baterem com o "
+                     "horário de gravação das câmeras.")
+        return keep
+
+    def _track_clock_offsets(self, usable, tidx) -> dict[int, float]:
+        offs: dict[int, list[float]] = defaultdict(list)
+        for c in usable:
+            cr = self._created(c)
+            if c.is_synced and not c.estimated and cr is not None:
+                offs[tidx[c.uid]].append(cr - self._pcm_start(c))
+        res = {}
+        for t, v in offs.items():
+            v = np.array(v)
+            med = float(np.median(v))
+            good = v[np.abs(v - med) <= self.opt.clock_tolerance]
+            if len(good) >= max(1, 0.6 * len(v)):
+                res[t] = float(np.median(good))
+        return res
+
+    def _same_track_free(self, c: Clip, start: float, usable, tidx, tol: float = 1.0) -> bool:
+        t = tidx[c.uid]
+        for o in usable:
+            if o is c or not o.is_synced or tidx[o.uid] != t:
+                continue
+            s0 = self._pcm_start(o)
+            if min(start + c.duration, s0 + o.duration) - max(start, s0) > tol:
+                return False
+        return True
+
+    def _place(self, c: Clip, pcm_start: float, status_msg: str, estimated: bool,
+               confidence: float = 0.0) -> None:
+        delay = c.info.audio_delay if (c.info and c.info.has_video) else 0.0
+        c.offset = pcm_start - delay
+        c.drift, c.drift_reliable = 0.0, False
+        c.status = Status.SYNCED
+        c.message = status_msg
+        c.estimated = estimated
+        c.confidence = confidence
+
+    def _guided(self, c: Clip, est: float, usable, tidx) -> Optional[tuple[float, float]]:
+        """Procura `c` só perto de `est` (posição prevista pelo relógio)."""
+        if c.uid not in self.feat:
+            return None
+        w = self.opt.clock_tolerance + 1.0
+        best = None
+        for s in usable:
+            if not s.is_synced or s.estimated or tidx[s.uid] == tidx[c.uid] \
+                    or s.uid not in self.feat:
+                continue
+            s0 = self._pcm_start(s)
+            if min(est + c.duration + w, s0 + s.duration) - max(est - w, s0) < 2.0:
+                continue
+            lag_exp = est - s0
+            m = coarse_match(self.feat[s.uid], self.feat[c.uid], min_overlap_s=2.0,
+                             lag_window=(lag_exp - w, lag_exp + w))
+            if m is None or m.score < self.opt.guided_score or m.ratio < 1.1:
+                continue
+            lag = m.lag
+            fm = refine_match(self.pcm[s.uid], self.pcm[c.uid], m.lag)
+            if fm is not None and abs(fm.lag - m.lag) < 0.3:
+                lag = fm.lag + (0.0 - fm.t_ref) * fm.drift if fm.drift_ok else fm.lag
+            start = s0 + (1.0 + s.drift) * lag
+            if best is None or m.score > best[1]:
+                best = (start, m.score)
+        return best
+
+    def _clock_pass(self, usable: list[Clip], tidx) -> None:
+        """Usa o horário de gravação para: (1) buscar, numa janela estreita, clipes que
+        a busca geral não achou; (2) posicionar grupos isolados e clipes sem áudio em
+        comum com as outras câmeras."""
+        placed_guided = placed_groups = placed_clock = 0
+        for _round in range(max(4, 2 * len(self._side_groups) + 4)):
+            offs = self._track_clock_offsets(usable, tidx)
+            if not offs:
+                return
+            changed = False
+            # (1) busca guiada para cada clipe ainda solto
+            for c in usable:
+                cr = self._created(c)
+                if c.is_synced or cr is None or tidx[c.uid] not in offs:
+                    continue
+                est = cr - offs[tidx[c.uid]]
+                g = self._guided(c, est, usable, tidx)
+                if g and self._same_track_free(c, g[0], usable, tidx):
+                    self._place(c, g[0], "encontrado pela busca guiada (horário da câmera)",
+                                False, g[1])
+                    placed_guided += 1
+                    changed = True
+            if changed:
+                continue
+            # (2) grupos isolados (sincronizados entre si pelo áudio)
+            for members, gpos in self._side_groups:
+                if any(usable[m].is_synced for m in members):
+                    continue
+                ests = [self._created(usable[m]) - offs[tidx[usable[m].uid]] - gpos[m]
+                        for m in members if self._created(usable[m]) is not None
+                        and tidx[usable[m].uid] in offs]
+                if not ests or np.ptp(ests) > 2 * self.opt.clock_tolerance:
+                    continue
+                shift = float(np.median(ests))
+                # tenta ancorar o grupo pelo áudio a algo já posicionado (busca guiada)
+                anchor = None
+                for m in members:
+                    g = self._guided(usable[m], gpos[m] + shift, usable, tidx)
+                    if g and (anchor is None or g[1] > anchor[1]):
+                        anchor = (g[0] - gpos[m], g[1])
+                precise = anchor is not None and abs(anchor[0] - shift) <= \
+                    2 * self.opt.clock_tolerance
+                if precise:
+                    shift = anchor[0]
+                if all(self._same_track_free(usable[m], gpos[m] + shift, usable, tidx)
+                       for m in members):
+                    msg = ("grupo sincronizado pelo áudio" if precise else
+                           "sincronizado pelo áudio com o par; grupo posicionado pelo "
+                           "horário da câmera")
+                    for m in members:
+                        self._place(usable[m], gpos[m] + shift, msg, False,
+                                    anchor[1] if precise else 0.0)
+                    placed_groups += len(members)
+                    changed = True
+                    break          # recalcula relógios e tenta os próximos com este como âncora
+            if changed:
+                continue
+            # (3) clipes sem nenhum áudio em comum: posição pelo relógio
+            in_groups = {usable[m].uid for members, _ in self._side_groups for m in members
+                         if not any(usable[x].is_synced for x in members)}
+            for c in usable:
+                cr = self._created(c)
+                if c.is_synced or cr is None or tidx[c.uid] not in offs or c.uid in in_groups:
+                    continue
+                est = cr - offs[tidx[c.uid]]
+                overlaps_other = any(
+                    o.is_synced and tidx[o.uid] != tidx[c.uid] and
+                    min(est + c.duration, self._pcm_start(o) + o.duration)
+                    - max(est, self._pcm_start(o)) > 2.0 for o in usable)
+                if not overlaps_other and self._same_track_free(c, est, usable, tidx):
+                    self._place(c, est, "sem áudio em comum — posicionado pelo horário da "
+                                "câmera", True)
+                    placed_clock += 1
+                    changed = True
+                elif overlaps_other:
+                    c.message = "não encontrou áudio em comum na posição prevista pelo horário"
+            if not changed:
+                break
+        if placed_guided or placed_groups or placed_clock:
+            self.log(f"Horário das câmeras: {placed_guided} pela busca guiada, "
+                     f"{placed_groups} em grupos isolados, {placed_clock} sem áudio em comum.")
 
     def _check_overlaps(self, rep: SyncReport) -> None:
         for t in self.project.tracks:

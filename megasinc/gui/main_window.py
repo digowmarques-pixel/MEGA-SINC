@@ -225,6 +225,12 @@ class OptionsDialog(QDialog):
         self.same = QCheckBox("Comparar clipes da mesma faixa (câmera com arquivos sobrepostos)")
         self.same.setChecked(o["same_track"])
         lay.addWidget(self.same)
+        self.clockbox = QCheckBox("Usar o horário de gravação das câmeras (recomendado)")
+        self.clockbox.setToolTip(
+            "Descarta correspondências falsas, procura clipes difíceis perto da posição\n"
+            "prevista e posiciona clipes/grupos que não têm áudio em comum.")
+        self.clockbox.setChecked(o["use_clock"])
+        lay.addWidget(self.clockbox)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
@@ -235,7 +241,8 @@ class OptionsDialog(QDialog):
                         method=self.method.currentData(),
                         fps=self.fps.currentText(), min_score=self.score.value(),
                         fcpxml_version=self.fcpx.currentText(),
-                        same_track=self.same.isChecked())
+                        same_track=self.same.isChecked(),
+                        use_clock=self.clockbox.isChecked())
         win.project.reference = self.ref.currentData()
 
 
@@ -529,6 +536,7 @@ class MainWindow(QMainWindow):
             "min_score": float(s.value("min_score", SyncOptions.min_score)),
             "fcpxml_version": s.value("fcpxml_version", "1.10"),
             "same_track": s.value("same_track", "false") == "true",
+            "use_clock": s.value("use_clock", "true") == "true",
         }
         geo = s.value("geometry")
         if geo is not None:
@@ -642,7 +650,10 @@ class MainWindow(QMainWindow):
             self.strip.result(f"✖ Nenhum clipe sincronizado ({len(failed)} com problema)",
                               ok=False)
         elif synced:
-            self.strip.result(f"✔ {len(synced)}/{len(clips)} clipes sincronizados", ok=True)
+            est = sum(1 for c in synced if c.estimated)
+            extra = f" ({est} sem áudio em comum, posicionados pelo horário)" if est else ""
+            self.strip.result(f"✔ {len(synced)}/{len(clips)} clipes sincronizados{extra}",
+                              ok=True)
         else:
             ready = sum(1 for c in clips if c.prep >= 1.0)
             self.strip.idle(f"{len(clips)} arquivo(s) em {len(self.project.tracks)} faixa(s) — "
@@ -1035,6 +1046,7 @@ class MainWindow(QMainWindow):
         o = self.opts
         opts = SyncOptions(min_score=o["min_score"], compare_same_track=o["same_track"],
                            timeline_clock=o["clock"], method=o["method"],
+                           use_clock=o["use_clock"],
                            cache_dir=self.cache_dir)
         self.log("\n— Sincronização iniciada —")
 
@@ -1045,7 +1057,7 @@ class MainWindow(QMainWindow):
         def done(rep):
             self.refresh(fit=True)
             if rep.warnings:
-                QMessageBox.warning(self, APP_NAME, "\n\n".join(rep.warnings[:8]))
+                self.log("Avisos:\n  " + "\n  ".join(rep.warnings))
 
         self.start_task(work, done, "Sincronizando",
                         on_progress=lambda: self.timeline.canvas.update())

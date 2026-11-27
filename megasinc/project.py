@@ -34,6 +34,7 @@ class Clip:
     drift: float = 0.0
     drift_reliable: bool = False
     confidence: float = 0.0
+    estimated: bool = False      # posição pelo horário da câmera (sem áudio em comum)
     # transitório (não salvo no projeto): preparação e forma de onda
     prep: float = field(default=0.0, repr=False, compare=False)
     wave: Optional[object] = field(default=None, repr=False, compare=False)
@@ -80,6 +81,7 @@ class Clip:
         self.drift = 0.0
         self.drift_reliable = False
         self.confidence = 0.0
+        self.estimated = False
 
 
 @dataclass
@@ -129,7 +131,9 @@ def group_key(path: str, mode: str) -> tuple[str, str]:
     if mode == "folder":
         return f"{p.parent}|{kind}", folder + (" (áudio)" if kind == "a" else "")
     prefix = device_prefix(p.stem)
-    return f"{p.parent}|{prefix.lower()}|{kind}", prefix
+    # prefixo curto ("P", "C", "GX"...) não identifica o aparelho: usa a pasta
+    label = prefix if len(prefix) > 2 else (folder or prefix)
+    return f"{p.parent}|{prefix.lower()}|{kind}", label
 
 
 def expand_paths(paths: Iterable[str]) -> list[str]:
@@ -207,6 +211,9 @@ class Project:
             tname = self._keys.get(key)
             track = self.track(tname) if tname else None
             if track is None:
+                folder = Path(ap).parent.name
+                if self.track(label) is not None and folder and folder != label:
+                    label = folder           # mesmo prefixo em outra pasta: nome da pasta
                 track = self.add_track(label)
                 self._keys[key] = track.name
             clip = Clip(path=ap)
@@ -268,6 +275,7 @@ class Project:
                     {"path": c.path, "status": c.status, "message": c.message,
                      "offset": c.offset, "drift": c.drift,
                      "drift_reliable": c.drift_reliable, "confidence": c.confidence,
+                     "estimated": c.estimated,
                      "info": c.info.to_dict() if c.info else None}
                     for c in t.clips]}
                 for t in self.tracks],
@@ -287,6 +295,7 @@ class Project:
                 c.drift = cd.get("drift", 0.0)
                 c.drift_reliable = cd.get("drift_reliable", False)
                 c.confidence = cd.get("confidence", 0.0)
+                c.estimated = cd.get("estimated", False)
                 if cd.get("info"):
                     c.info = MediaInfo.from_dict(cd["info"])
                 t.clips.append(c)
