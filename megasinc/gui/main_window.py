@@ -327,6 +327,7 @@ class MainWindow(QMainWindow):
         self.project_path: Optional[str] = None
         self.cache_dir = default_cache_dir()
         self._probed = 0
+        self._undo: list[dict] = []      # ajustes manuais (para desfazer)
         self.opts = {}
         self._load_settings()
         self._build_ui()
@@ -370,8 +371,9 @@ class MainWindow(QMainWindow):
         zoom.setObjectName("zoomBar")
         zl = QHBoxLayout(zoom)
         zl.setContentsMargins(12, 2, 12, 2)
-        self.hint = QLabel("Arraste clipes entre faixas para reagrupar · botão direito no nome "
-                           "da faixa para mais opções · Ctrl + roda do mouse = zoom")
+        self.hint = QLabel("Arraste clipes para reagrupar ou ajustar a posição · ← → move 1 "
+                           "quadro (Shift = 10) · Ctrl+Z desfaz · botão direito no nome da "
+                           "faixa = opções · Ctrl + roda = zoom")
         self.hint.setObjectName("hint")
         zl.addWidget(self.hint, 1)
         for txt, f in (("−", 0.8), ("+", 1.25)):
@@ -395,6 +397,8 @@ class MainWindow(QMainWindow):
         cv.filesDropped.connect(self.add_paths)
         cv.deleteRequested.connect(self.on_remove_selected)
         cv.clipSelected.connect(self.select_in_tree)
+        cv.clipAdjusted.connect(self.on_clip_adjusted)
+        cv.nudgeRequested.connect(self.on_nudge)
 
         self.strip = StatusStrip()
         self.strip.cancelRequested.connect(self.on_cancel)
@@ -444,6 +448,11 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         m.addAction("Limpar tudo", self.on_clear)
         m.addAction("Sair", self.close, QKeySequence.Quit)
+        m = mb.addMenu("E&ditar")
+        self.a_undo = m.addAction("Desfazer ajuste manual", self.on_undo, QKeySequence.Undo)
+        self.a_undo.setEnabled(False)
+        m.addSeparator()
+        m.addAction("Remover clipe selecionado", self.on_remove_selected)
         m = mb.addMenu("&Sincronia")
         self.a_sync = m.addAction("Sincronizar", self.on_sync, QKeySequence("Ctrl+Return"))
         m.addAction("Cancelar", self.on_cancel, QKeySequence("Esc"))
@@ -771,6 +780,57 @@ class MainWindow(QMainWindow):
             self.log("Faixas alteradas — sincronize novamente.")
         self.refresh(fit=True)
 
+    # ---------------------------------------------------------- ajuste manual
+    def _snapshot(self, c) -> dict:
+        t = self.project.track_of(c)
+        return {"uid": c.uid, "track": t.name if t else None, "offset": c.offset,
+                "drift": c.drift, "drift_reliable": c.drift_reliable, "status": c.status,
+                "message": c.message, "confidence": c.confidence}
+
+    def on_clip_adjusted(self, uid: int, t_new: float, target: str) -> None:
+        c = self.project.clip_by_uid(uid)
+        if c is None or self.busy():
+            return
+        self._undo.append(self._snapshot(c))
+        self.a_undo.setEnabled(True)
+        if target == "__new__":
+            target = self.project.add_track("Câmera" if c.has_video else "Gravador").name
+        if target:
+            self.project.move_clip(c, target)
+            self.project.remove_empty_tracks()
+        if c.offset is None or c.status in FAILED:
+            c.drift, c.drift_reliable = 0.0, False
+        placement = t_new - self.timeline.canvas.shift
+        c.offset = placement - c.drift * c.duration / 2
+        if c.status != Status.REFERENCE:
+            c.status = Status.SYNCED
+            c.message = "ajuste manual"
+        self.log(f"Ajuste manual: {c.name} → "
+                 f"{seconds_to_tc(max(0.0, t_new), self.timeline.canvas.fps)}")
+        self.refresh()
+
+    def on_nudge(self, uid: int, frames: int) -> None:
+        cv = self.timeline.canvas
+        blk = next((b for b in cv.blocks if b.clip.uid == uid), None)
+        if blk is not None and not cv.rows[blk.row].fail:
+            self.on_clip_adjusted(uid, blk.start + frames / float(cv.fps), "")
+
+    def on_undo(self) -> None:
+        if not self._undo:
+            return
+        st = self._undo.pop()
+        c = self.project.clip_by_uid(st["uid"])
+        if c is not None:
+            if st["track"] and (self.project.track_of(c) is None or
+                                self.project.track_of(c).name != st["track"]):
+                self.project.move_clip(c, st["track"])
+                self.project.remove_empty_tracks()
+            for k in ("offset", "drift", "drift_reliable", "status", "message", "confidence"):
+                setattr(c, k, st[k])
+            self.log(f"Desfeito: {c.name}")
+        self.a_undo.setEnabled(bool(self._undo))
+        self.refresh()
+
     def on_rename_track(self, name: str) -> None:
         new, ok = QInputDialog.getText(self, "Renomear faixa", "Nome da faixa:", text=name)
         if ok and new.strip():
@@ -865,6 +925,7 @@ class MainWindow(QMainWindow):
             return
         self.project.clear()
         self.project_path = None
+        self._undo.clear()
         self.refresh(fit=True)
 
     def on_tree_double_click(self, item, _col) -> None:
@@ -887,6 +948,12 @@ class MainWindow(QMainWindow):
     def on_sync(self) -> None:
         if self.busy() or not self.project.all_clips():
             return
+        if self._undo and QMessageBox.question(
+                self, APP_NAME, "Sincronizar de novo desfaz os ajustes manuais. Continuar?") \
+                != QMessageBox.Yes:
+            return
+        self._undo.clear()
+        self.a_undo.setEnabled(False)
         o = self.opts
         opts = SyncOptions(min_score=o["min_score"], compare_same_track=o["same_track"],
                            timeline_clock=o["clock"], method=o["method"],

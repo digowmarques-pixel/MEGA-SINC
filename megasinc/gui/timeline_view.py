@@ -85,6 +85,9 @@ class TimelineCanvas(QWidget):
     trackRename = Signal(str)
     filesDropped = Signal(list, object)     # caminhos, faixa ou None
     deleteRequested = Signal()
+    clipAdjusted = Signal(int, float, str)  # uid, novo início na timeline, faixa
+                                            # ("" = mesma, "__new__" = nova faixa)
+    nudgeRequested = Signal(int, int)       # uid, quadros (+/-)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -102,6 +105,9 @@ class TimelineCanvas(QWidget):
         self.total = 0.0
         self._rects: list[tuple[QRectF, Block]] = []
         self._drag: Optional[tuple[int, QPointF]] = None
+        self._press: Optional[tuple[Block, QPointF]] = None   # clipe e ponto do clique
+        self._drag_active = False
+        self.shift = 0.0         # deslocamento aplicado pela timeline
         self._drag_row: Optional[int] = None
         self._drop_row: Optional[int] = None
         self._auto_fit = True
@@ -127,6 +133,7 @@ class TimelineCanvas(QWidget):
         if self.synced_mode:
             tl = build_timeline(pr, fps)
             self.fps = tl.fps
+            self.shift = tl.shift
             lanes = {t.name: t.lanes for t in tl.tracks}
             row_index = {}
             for t in pr.tracks:
@@ -280,16 +287,43 @@ class TimelineCanvas(QWidget):
         p.drawLine(QPointF(left + HEAD_W, 0), QPointF(left + HEAD_W, self.height()))
 
         # fantasma do arraste
-        if self._drag and self._drag_row is not None:
-            uid, pos = self._drag
-            blk = next((b for b in self.blocks if b.clip.uid == uid), None)
-            if blk is not None:
+        if self._drag_active and self._press is not None and self._drag is not None:
+            blk, p0 = self._press
+            pos = self._drag[1]
+            k = self._drag_row
+            if self.synced_mode and k is not None:
+                t_new = self._dragged_start(blk, p0, pos)
+                if k < len(self.rows) and not self.rows[k].fail:
+                    y, h = self.rows[k].y, self.rows[k].h
+                elif k == len(self.rows):
+                    y, h = self.rows[-1].y + self.rows[-1].h + 2, ROW_H
+                else:
+                    y, h = self.rows[blk.row].y, self.rows[blk.row].h
+                x0 = self.x_of(t_new)
+                ghost = QRectF(x0, y + 4, max(3.0, blk.dur * self.px_per_s - 1), h - 8)
+                p.setPen(QPen(QColor("#FFFFFF"), 2, Qt.DashLine))
+                p.setBrush(QColor(255, 196, 0, 70))
+                p.drawRoundedRect(ghost, 3, 3)
+                p.setPen(QPen(YELLOW, 1))
+                p.drawLine(QPointF(x0, RULER_H), QPointF(x0, self.height()))
+                lab = (f"{seconds_to_tc(max(0.0, t_new), self.fps)}   "
+                       f"({t_new - blk.start:+.3f} s)")
+                p.fillRect(QRectF(x0 + 4, RULER_H + 2, fm.horizontalAdvance(lab) + 10, 18),
+                           QColor("#000000"))
+                p.setPen(YELLOW)
+                p.drawText(QPointF(x0 + 9, RULER_H + 15), lab)
+            elif k is not None:
                 p.setPen(QPen(YELLOW, 2, Qt.DashLine))
                 p.setBrush(QColor(255, 196, 0, 40))
                 p.drawRoundedRect(QRectF(pos.x() - 60, pos.y() - 18, 180, 36), 6, 6)
                 p.setPen(TEXT)
                 p.drawText(QRectF(pos.x() - 54, pos.y() - 18, 170, 36), Qt.AlignVCenter,
                            fm.elidedText(blk.clip.name, Qt.ElideRight, 165))
+
+    def _dragged_start(self, blk: Block, p0: QPointF, pos: QPointF) -> float:
+        t = blk.start + (pos.x() - p0.x()) / self.px_per_s
+        f = float(self.fps)
+        return round(t * f) / f          # encaixa no quadro
 
     def _clip_color(self, b: Block, row: Row) -> QColor:
         c = b.clip
@@ -436,6 +470,7 @@ class TimelineCanvas(QWidget):
 
     def mousePressEvent(self, ev) -> None:  # noqa: N802
         pos = ev.position()
+        self.setFocus()
         if self._in_header(pos):
             k = self._row_at(pos.y())
             if k is not None and k < len(self.rows) and not self.rows[k].fail and \
@@ -449,7 +484,9 @@ class TimelineCanvas(QWidget):
             if ev.button() == Qt.RightButton:
                 self.clipMenu.emit(b.clip.uid, ev.globalPosition().toPoint())
             elif ev.button() == Qt.LeftButton:
+                self._press = (b, pos)
                 self._drag = (b.clip.uid, pos)
+                self._drag_active = False
         self.update()
 
     def mouseDoubleClickEvent(self, ev) -> None:  # noqa: N802
@@ -461,12 +498,13 @@ class TimelineCanvas(QWidget):
 
     def mouseMoveEvent(self, ev) -> None:  # noqa: N802
         pos = ev.position()
-        if self._drag and ev.buttons() & Qt.LeftButton:
-            uid, start = self._drag
-            if (pos - start).manhattanLength() > 8:
-                self._drag = (uid, pos)
+        if self._press and ev.buttons() & Qt.LeftButton:
+            blk, p0 = self._press
+            if self._drag_active or (pos - p0).manhattanLength() > 6:
+                self._drag_active = True
+                self._drag = (blk.clip.uid, pos)
                 self._drag_row = self._row_at(pos.y())
-                self._drop_row = self._drag_row
+                self._drop_row = None if self.synced_mode else self._drag_row
                 self.update()
             return
         b = self._block_at(pos)
@@ -493,19 +531,31 @@ class TimelineCanvas(QWidget):
         QToolTip.showText(ev.globalPosition().toPoint(), "<br>".join(lines), self)
 
     def mouseReleaseEvent(self, ev) -> None:  # noqa: N802
-        if self._drag and self._drag_row is not None:
-            uid = self._drag[0]
+        if self._press and self._drag_active and self._drag is not None:
+            blk, p0 = self._press
+            pos = self._drag[1]
             k = self._drag_row
-            blk = next((b for b in self.blocks if b.clip.uid == uid), None)
-            if blk is not None:
+            cur = self.project.track_of(blk.clip) if self.project else None
+            if self.synced_mode:
+                t_new = self._dragged_start(blk, p0, pos)
+                target = ""
                 if k == len(self.rows):
-                    self.clipMoved.emit(uid, "")
+                    target = "__new__"
+                elif k is not None and 0 <= k < len(self.rows) and not self.rows[k].fail:
+                    if cur is None or self.rows[k].track != cur.name:
+                        target = self.rows[k].track
+                failed_row = self.rows[blk.row].fail
+                if abs(t_new - blk.start) > 1e-9 or target or failed_row:
+                    self.clipAdjusted.emit(blk.clip.uid, t_new, target)
+            elif k is not None:
+                if k == len(self.rows):
+                    self.clipMoved.emit(blk.clip.uid, "")
                 elif 0 <= k < len(self.rows) and not self.rows[k].fail:
-                    target = self.rows[k].track
-                    if self.project and self.project.track_of(blk.clip) and \
-                            self.project.track_of(blk.clip).name != target:
-                        self.clipMoved.emit(uid, target)
+                    if cur is not None and cur.name != self.rows[k].track:
+                        self.clipMoved.emit(blk.clip.uid, self.rows[k].track)
+        self._press = None
         self._drag = None
+        self._drag_active = False
         self._drag_row = None
         self._drop_row = None
         self.update()
@@ -513,6 +563,11 @@ class TimelineCanvas(QWidget):
     def keyPressEvent(self, ev) -> None:  # noqa: N802
         if ev.key() in (Qt.Key_Delete, Qt.Key_Backspace) and self.selected is not None:
             self.deleteRequested.emit()
+        elif ev.key() in (Qt.Key_Left, Qt.Key_Right) and self.selected is not None \
+                and self.synced_mode:
+            step = 10 if ev.modifiers() & Qt.ShiftModifier else 1
+            self.nudgeRequested.emit(self.selected,
+                                     step if ev.key() == Qt.Key_Right else -step)
         else:
             super().keyPressEvent(ev)
 
